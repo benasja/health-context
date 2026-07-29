@@ -363,7 +363,15 @@ def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, 
 
 def is_stand_hour_met(rec: HealthRecord) -> bool:
     label = (rec.category_value or '').lower()
-    if 'stood' in label or 'applestandhour' in label.replace('_', ''):
+    if label:
+        # "applestandhour" is a substring of both the Stood and Idle category
+        # values, so it can't be used to tell them apart — only "idle" and
+        # "stood" themselves can. Pre-iOS-13-era exports predate the Idle
+        # case entirely and use the bare value with no Stood/Idle suffix at
+        # all; every record in that format is inherently a met hour, since
+        # idle hours weren't recorded as samples yet.
+        if 'idle' in label:
+            return False
         return True
     if rec.value is not None and rec.value >= 1:
         return True

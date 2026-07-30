@@ -4,6 +4,8 @@ Turns an Apple Health export (`export.xml`) into analysis-ready CSVs **and** a
 computed insights report — baselines, deviations, trends and personal
 associations, rather than a pile of rows to eyeball.
 
+Python 3.10+. **No dependencies** — standard library only.
+
 ## Quick start
 
 1. Health app → profile picture → **Export All Health Data**.
@@ -125,7 +127,19 @@ computed with circular statistics so times either side of midnight compare
 correctly.
 
 **Training load** — acute (7-day) to chronic (28-day) exercise-minute ratio.
-The 0.8–1.5 band is the commonly cited sweet spot.
+The 0.8–1.5 band is the commonly cited sweet spot. Below a 28-day mean of
+21 min/day (~150 min/week, the WHO activity guideline) the ratio is reported
+but deliberately **not** classified: at 10 min/day a single 45-minute session
+moves it across a whole category, so the label would describe one workout
+rather than a training pattern. The ratio is a contested heuristic from
+team-sport research and assumes near-daily training.
+
+**Cycling power** — where a trainer or power meter recorded watts, the
+duration-weighted average is reported against your FTP. Power is *measured*
+rather than inferred, so unlike heart rate it does not drift with heat,
+caffeine, sleep or stress — it is the most reliable intensity figure an Apple
+Health export contains. Roughly: under 55% of FTP is recovery riding, 56–75%
+endurance, 76–90% tempo, above 90% threshold.
 
 **Associations** — lagged correlations between what you do and what your body
 does next (sleep → next-day HRV, steps → next-night deep sleep, and so on).
@@ -185,12 +199,47 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
 
+## Development
+
+```bash
+python3 test_health.py                  # 157 tests, stdlib only
+pip install ruff && ruff check .
+```
+
+Every test corresponds to a bug that actually shipped and produced a plausible
+*wrong number* rather than an error — percent metrics reported as fractions,
+sleep nights split across calendar days, an isolated sensor artifact setting max
+HR for a whole history, basal energy marking unworn days as worn. That is the
+failure mode worth defending against: a pipeline that crashes tells you it is
+broken, one that emits confident nonsense does not.
+
+CI runs the tests on Python 3.10–3.13 (plus macOS), lints, executes the fixture
+end-to-end, asserts every output file is non-empty, and **fails the build if any
+health-data file is ever tracked by git**.
+
 ## Privacy
 
 Your export stays on your machine; the tool makes no network calls. `.gitignore`
-excludes `export.xml`, `export_cda.xml`, `apple_health_export/`, `*.zip` and all
-generated CSVs — health data should never enter git history, where every version
-lives forever.
+excludes `export.xml`, `export_cda.xml`, `apple_health_export/`,
+`electrocardiograms/`, `workout-routes/`, `*.zip` and all generated CSVs —
+health data should never enter git history, where every version lives forever.
+CI enforces this, so a fork cannot quietly regress it.
+
+## Limitations
+
+**Validated against one person's export.** Every fix so far was driven by a
+single ~2M-record dataset from an Apple Watch + iPhone + Wahoo trainer. Other
+devices, apps and locales will exercise paths that have never run. Bug reports
+describing the shape of your data are genuinely useful.
+
+**Scores are judgement, not instruments.** The recovery weights, the load-band
+thresholds, the 90-minute sleep-session gap, the 21 min/day load floor — all
+documented at their definitions, none derived from research on you. Component
+breakdowns are always emitted so a number can be audited rather than trusted.
+
+**Eras are bucketing, not change-point detection.** The timeline is split by a
+smoothed load signal crossing fixed thresholds. Boundaries can therefore land
+close to an edge, and the output prints how close.
 
 ## Not medical advice
 

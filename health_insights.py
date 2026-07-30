@@ -45,6 +45,14 @@ SLEEP_TARGET_HOURS = 7.5
 ACWR_LOW = 0.8
 ACWR_HIGH = 1.5
 
+# Below this chronic load the ratio stops carrying information. At a 28-day mean
+# of 10 min/day a single 45-minute session lifts the 7-day mean by 6.4 min/day
+# and swings the ratio from "detraining" to "steady"; two sessions reach "spike".
+# The classification would then describe one workout, not a training pattern.
+# The threshold is ~150 min/week, the WHO minimum-activity guideline, which is
+# also roughly where a session stops dominating the ratio.
+ACWR_MIN_CHRONIC_LOAD = 21.0  # minutes/day averaged over 28 days
+
 ILLNESS_MIN_SIGNALS = 2
 
 
@@ -380,7 +388,16 @@ def build_daily_insights(
         if acute is not None and chronic and chronic > 0:
             ratio = acute / chronic
             rec['load_ratio'] = round(ratio, 2)
-            rec['load_status'] = 'spike' if ratio > ACWR_HIGH else ('detraining' if ratio < ACWR_LOW else 'steady')
+            if chronic < ACWR_MIN_CHRONIC_LOAD:
+                # Ratio still reported so the arithmetic is visible, but refusing
+                # to label it beats calling one workout a training pattern.
+                rec['load_status'] = 'volume too low to rate'
+            elif ratio > ACWR_HIGH:
+                rec['load_status'] = 'spike'
+            elif ratio < ACWR_LOW:
+                rec['load_status'] = 'detraining'
+            else:
+                rec['load_status'] = 'steady'
         else:
             rec['load_ratio'] = ''
             rec['load_status'] = ''
@@ -746,15 +763,32 @@ def render_insights_report(
     load = [r for r in insight_rows if r.get('load_ratio') != '']
     if load:
         latest = load[-1]
-        spikes = sum(1 for r in load if r.get('load_status') == 'spike')
+        rateable = [r for r in load if r.get('load_status') not in ('', 'volume too low to rate')]
+        spikes = sum(1 for r in rateable if r.get('load_status') == 'spike')
+        unrateable = len(load) - len(rateable)
+
         lines.extend([
             '## Training load',
             '',
             f"- Latest acute:chronic ratio: **{latest['load_ratio']}** ({latest['load_status']}) — "
             f"7-day mean {latest['load_acute_7d']} min/day vs 28-day mean {latest['load_chronic_28d']} min/day",
-            f'- Days in spike territory (ratio > {ACWR_HIGH}): **{spikes}**',
-            f'- Ratio between {ACWR_LOW} and {ACWR_HIGH} is the commonly cited sweet spot; '
-            'sustained spikes are the pattern associated with elevated injury risk.',
+        ])
+        if latest.get('load_status') == 'volume too low to rate':
+            lift = round(45.0 / 7.0, 1)
+            lines.append(
+                f'- The ratio is shown but deliberately not classified. At a 28-day mean of '
+                f"{latest['load_chronic_28d']} min/day, one 45-minute session raises the 7-day mean by "
+                f'~{lift} min/day and moves the ratio across a whole category, so the label would '
+                f'describe a single workout rather than a training pattern. Rating resumes above '
+                f'{ACWR_MIN_CHRONIC_LOAD:.0f} min/day (~150 min/week, the WHO activity guideline).'
+            )
+        lines.extend([
+            f'- Days rated (28-day load above {ACWR_MIN_CHRONIC_LOAD:.0f} min/day): **{len(rateable)}**'
+            f' — of those, **{spikes}** in spike territory (ratio > {ACWR_HIGH})',
+            f'- Days left unrated because volume was too low: **{unrateable}**',
+            f'- Between {ACWR_LOW} and {ACWR_HIGH} is the commonly cited sweet spot; sustained spikes '
+            'are the pattern associated with elevated injury risk. The ratio is a heuristic from team-sport '
+            'research, contested in the literature, and assumes near-daily training.',
             '',
         ])
 

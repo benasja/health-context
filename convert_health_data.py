@@ -191,8 +191,23 @@ def main() -> None:
     if os.path.exists(export_xml):
         iter_export_xml(export_xml, data)
     else:
-        print(f"Error: {export_xml} not found. Point --data-dir at your unzipped export.")
-        return
+        print(f"Error: no export.xml in {base_dir}")
+        # Apple's export arrives as a zip containing an apple_health_export/
+        # folder. Landing on the zip, or on the folder's parent, is the normal
+        # first attempt — so say which one happened rather than just failing.
+        nested = os.path.join(base_dir, 'apple_health_export', 'export.xml')
+        zips = glob.glob(os.path.join(base_dir, '*.zip'))
+        if os.path.exists(nested):
+            print(f"  Found one a level down. Try:\n"
+                  f"    python3 convert_health_data.py --data-dir "
+                  f"'{os.path.join(base_dir, 'apple_health_export')}'")
+        elif zips:
+            print(f"  Found {os.path.basename(zips[0])} — unzip it first, then point --data-dir "
+                  f"at the apple_health_export folder inside.")
+        else:
+            print("  Export from the Health app (profile icon -> Export All Health Data), unzip, "
+                  "then point --data-dir at the apple_health_export folder.")
+        raise SystemExit(1)
 
     if not args.include_cda:
         print('Skipping export_cda.xml (pass --include-cda to parse it as well)')
@@ -235,6 +250,25 @@ def main() -> None:
         print(f"Legacy rows: {len(legacy_rows):,} -> {output_csv}")
     for name, path in {**result.paths, **insight_paths}.items():
         print(f"  {name}: {path}")
+
+    # An export the parser could not use still writes every output file, so
+    # "COMPLETE" alone would read as success. Say what was actually found.
+    n_days = len(result.daily_rows)
+    print()
+    if n_days == 0:
+        print("WARNING: no usable daily data was found in this export.")
+        print("  The files above are empty. Check that export.xml is the real Apple Health")
+        print("  export and not a placeholder, and that it contains <Record> entries.")
+        return
+    if result.analysis_start is None:
+        print(f"WARNING: {n_days} day(s) parsed, but no metric is tracked densely enough to")
+        print("  open an analysis window. Records and trends need a continuously-recorded")
+        print("  metric (resting heart rate, HRV or staged sleep) over several weeks.")
+        print(f"  See {result.paths['metric_coverage']} for what was found.")
+        return
+
+    span = f"{result.analysis_start.isoformat()} onward"
+    print(f"Parsed {n_days:,} days; analysis window {span}.")
     print(f"\nStart with {insight_paths['insights_report']}")
     print(f"Paste {insight_paths['llm_context']} into an LLM for coaching.")
 

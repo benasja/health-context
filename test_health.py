@@ -46,6 +46,7 @@ from health_history import (
     modality_breakdown,
     month_by_year_grid,
     percentile,
+    power_summary,
     progression_target,
     segment_eras,
     signal_kind,
@@ -53,6 +54,7 @@ from health_history import (
     zone_totals,
 )
 from health_insights import (
+    ACWR_MIN_CHRONIC_LOAD,
     build_daily_insights,
     build_series,
     carry_forward,
@@ -1199,6 +1201,101 @@ class TestRegistryIntegrity(unittest.TestCase):
 
     def test_date_is_the_first_column(self):
         self.assertEqual(daily_column_order()[0], 'date')
+
+
+class TestTrainingLoadGate(unittest.TestCase):
+    """ACWR is a heuristic for people training near-daily. At 10 min/day one
+    session swings it across a whole category, so the label described a single
+    workout rather than a pattern."""
+
+    def _rows(self, minutes_per_day):
+        rows = []
+        for i in range(60):
+            d = date(2026, 1, 1) + timedelta(days=i)
+            rows.append({'date': d.isoformat(), 'exercise_minutes': str(minutes_per_day),
+                         'wear_class': 'full'})
+        return rows
+
+    def test_low_volume_is_not_classified(self):
+        insights = build_daily_insights(self._rows(10), None)
+        last = insights[-1]
+        self.assertEqual(last['load_status'], 'volume too low to rate')
+        # The ratio itself is still shown, so the arithmetic stays auditable.
+        self.assertNotEqual(last['load_ratio'], '')
+
+    def test_adequate_volume_is_classified(self):
+        insights = build_daily_insights(self._rows(45), None)
+        self.assertEqual(insights[-1]['load_status'], 'steady')
+
+    def test_threshold_is_the_who_guideline(self):
+        # ~150 min/week. Below it, a single session dominates the ratio.
+        self.assertAlmostEqual(ACWR_MIN_CHRONIC_LOAD, 21.0)
+        self.assertLess(ACWR_MIN_CHRONIC_LOAD * 7, 155)
+
+    def test_spike_still_detected_above_the_gate(self):
+        rows = self._rows(40)
+        for row in rows[-7:]:
+            row['exercise_minutes'] = '120'
+        insights = build_daily_insights(rows, None)
+        self.assertEqual(insights[-1]['load_status'], 'spike')
+
+
+class TestCyclingPower(unittest.TestCase):
+    """Watts are the only measured intensity in a Health export; heart rate is
+    an inferred, lagging proxy."""
+
+    def _session(self, day, minutes, avg_w, max_w=None):
+        return WorkoutSession(day=day, activity='Cycling', minutes=minutes,
+                              zones={}, power_avg_w=avg_w, power_max_w=max_w)
+
+    def test_average_is_weighted_by_duration(self):
+        # A 10-minute blast must not outweigh a 90-minute ride.
+        sessions = [
+            self._session(date(2026, 5, 1), 90.0, 100.0),
+            self._session(date(2026, 5, 2), 10.0, 300.0),
+        ]
+        summary = power_summary(sessions)
+        self.assertAlmostEqual(summary.avg_w, 120.0, places=1)  # not the naive 200
+
+    def test_percentage_of_ftp(self):
+        sessions = [self._session(date(2026, 5, 1), 60.0, 103.0)]
+        summary = power_summary(sessions, ftp_w=206.0)
+        self.assertAlmostEqual(summary.pct_of_ftp, 50.0, places=1)
+
+    def test_no_ftp_leaves_percentage_unset(self):
+        sessions = [self._session(date(2026, 5, 1), 60.0, 110.0)]
+        self.assertIsNone(power_summary(sessions).pct_of_ftp)
+
+    def test_sessions_without_power_are_ignored(self):
+        sessions = [
+            self._session(date(2026, 5, 1), 60.0, 110.0),
+            WorkoutSession(day=date(2026, 5, 2), activity='Walking', minutes=60.0, zones={}),
+        ]
+        self.assertEqual(power_summary(sessions).sessions, 1)
+
+    def test_no_power_data_returns_none(self):
+        sessions = [WorkoutSession(day=date(2026, 5, 2), activity='Walking',
+                                   minutes=60.0, zones={})]
+        self.assertIsNone(power_summary(sessions))
+
+    def test_window_scoping(self):
+        sessions = [
+            self._session(date(2026, 4, 1), 60.0, 100.0),
+            self._session(date(2026, 5, 1), 60.0, 200.0),
+        ]
+        scoped = power_summary(sessions, None, date(2026, 4, 20), date(2026, 5, 30))
+        self.assertEqual(scoped.sessions, 1)
+        self.assertAlmostEqual(scoped.avg_w, 200.0)
+
+    def test_best_ride_is_reported_with_its_date(self):
+        sessions = [
+            self._session(date(2026, 5, 1), 60.0, 100.0),
+            self._session(date(2026, 5, 8), 60.0, 125.0, max_w=610.0),
+        ]
+        summary = power_summary(sessions)
+        self.assertAlmostEqual(summary.best_avg_w, 125.0)
+        self.assertEqual(summary.best_day, date(2026, 5, 8))
+        self.assertAlmostEqual(summary.max_w, 610.0)
 
 
 if __name__ == '__main__':

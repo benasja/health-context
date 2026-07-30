@@ -89,6 +89,8 @@ DAILY_SPECS: list[MetricSpec] = [
                label='Time in daylight (min)', round_to=0),
     MetricSpec(Q + 'DistanceCycling', 'cycling_km', 'sum', unit_kind='distance',
                group='activity', label='Cycling distance (km)', round_to=3),
+    MetricSpec(Q + 'CyclingFunctionalThresholdPower', 'cycling_ftp_w', 'latest',
+               group='activity', label='Cycling FTP (W)', round_to=0),
 
     # --- Cardiovascular -----------------------------------------------------
     MetricSpec(Q + 'RestingHeartRate', 'resting_hr', 'mean', group='cardio',
@@ -249,7 +251,8 @@ for _col, _group, _label in DERIVED_DAILY_COLUMNS:
 SPARSE_BY_DESIGN: set[str] = {
     'body_mass_kg', 'body_fat_pct', 'lean_body_mass_kg', 'bmi', 'height_cm',
     'vo2max', 'hr_recovery_1min', 'six_min_walk_m', 'walking_steadiness_pct',
-    'afib_burden_pct', 'alcohol_drinks', 'mindful_minutes',
+    'afib_burden_pct', 'alcohol_drinks', 'mindful_minutes', 'cycling_ftp_w',
+    'cycling_km',
 }
 
 # Columns that should be carried forward when interpolating a "current value"

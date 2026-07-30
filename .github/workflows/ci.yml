@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor: the code uses zip(strict=), dataclass(slots=True)
+        # and PEP 604 unions at runtime.
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        os: [ubuntu-latest]
+        include:
+          # The tool is used mostly on macOS, where an Apple Health export
+          # lands. One macOS job guards against path and locale surprises
+          # without quadrupling CI time.
+          - os: macos-latest
+            python-version: '3.13'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        run: python test_health.py
+
+      - name: End-to-end run against the sample fixture
+        run: |
+          mkdir -p ci-run
+          cp fixtures/sample_export.xml ci-run/export.xml
+          python convert_health_data.py --data-dir ci-run
+
+      - name: Every expected output exists and is non-empty
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in full_health_data.csv daily_metrics.csv workout_summary.csv \
+                   weekly_summary.csv metric_coverage.csv available_types.csv \
+                   data_quality_report.txt daily_insights.csv \
+                   insights_report.md llm_context.md; do
+            if [ ! -s "ci-run/$f" ]; then
+              echo "missing or empty: $f"
+              exit 1
+            fi
+            echo "ok: $f"
+          done
+
+      - name: Reject a run that silently produced no data
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The fixture has two days. A header-only CSV means the pipeline ran
+          # to completion while parsing nothing — the failure mode that looks
+          # like success.
+          rows=$(($(wc -l < ci-run/daily_metrics.csv) - 1))
+          echo "daily rows: $rows"
+          [ "$rows" -ge 1 ]
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install ruff==0.16.0
+      - run: ruff check .
+
+  no-data-committed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if a real health export was ever committed
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Health data must never enter git history. This repo is public and
+          # git keeps every version forever, so a single bad commit is not
+          # undone by deleting the file later.
+          bad=$(git ls-files | grep -E '(^|/)(export\.xml|export_cda\.xml|export\.zip)$|^apple_health_export/|^electrocardiograms/|^workout-routes/' || true)
+          if [ -n "$bad" ]; then
+            echo "personal health data is tracked by git:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no health data tracked"

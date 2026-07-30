@@ -475,6 +475,11 @@ class WorkoutSession:
     activity: str
     minutes: float
     zones: dict[str, float]
+    # Cycling power from a trainer or power meter. Where it exists it is a far
+    # better intensity measure than heart rate — it is a direct mechanical
+    # measurement rather than a lagging physiological response to one.
+    power_avg_w: float | None = None
+    power_max_w: float | None = None
 
 
 @dataclass(frozen=True)
@@ -512,9 +517,67 @@ def parse_workouts(
             activity=str(row.get('activity_type') or 'Unknown'),
             minutes=to_float(row.get('duration_min')) or 0.0,
             zones=zones,
+            power_avg_w=to_float(row.get('cycling_power_avg_w')),
+            power_max_w=to_float(row.get('cycling_power_max_w')),
         ))
     out.sort(key=lambda s: s.day)
     return out
+
+
+@dataclass(frozen=True)
+class PowerSummary:
+    sessions: int
+    minutes: float
+    avg_w: float
+    best_avg_w: float
+    best_day: date
+    max_w: float | None
+    first: date
+    last: date
+    ftp_w: float | None
+    pct_of_ftp: float | None
+
+
+def power_summary(
+    sessions: Sequence[WorkoutSession],
+    ftp_w: float | None = None,
+    start: date | None = None,
+    end: date | None = None,
+) -> PowerSummary | None:
+    """Cycling power, expressed against FTP where it is known.
+
+    Watts are the one place in a Health export where intensity is measured
+    rather than inferred. Without FTP as a reference, 109 W is an uninterpretable
+    number; against a 206 W threshold it is unambiguously recovery riding.
+    """
+    scoped = [
+        s for s in sessions
+        if s.power_avg_w is not None and s.minutes > 0
+        and (start is None or s.day >= start)
+        and (end is None or s.day <= end)
+    ]
+    if not scoped:
+        return None
+
+    total_minutes = sum(s.minutes for s in scoped)
+    # Weight by duration: a 90-minute ride says more about typical intensity
+    # than a 10-minute one, and a plain mean would let the short ride shout.
+    weighted = sum(s.power_avg_w * s.minutes for s in scoped) / total_minutes
+    best = max(scoped, key=lambda s: s.power_avg_w)
+    peaks = [s.power_max_w for s in scoped if s.power_max_w is not None]
+
+    return PowerSummary(
+        sessions=len(scoped),
+        minutes=total_minutes,
+        avg_w=weighted,
+        best_avg_w=best.power_avg_w,
+        best_day=best.day,
+        max_w=max(peaks) if peaks else None,
+        first=min(s.day for s in scoped),
+        last=max(s.day for s in scoped),
+        ftp_w=ftp_w,
+        pct_of_ftp=(100.0 * weighted / ftp_w) if ftp_w else None,
+    )
 
 
 def modality_breakdown(
@@ -1113,6 +1176,8 @@ class HistoryResult:
     recent_zones: dict[str, float] = field(default_factory=dict)
     workouts_with_zones: int = 0
     max_hr: float | None = None
+    power: PowerSummary | None = None
+    recent_power: PowerSummary | None = None
     events: list[InferredEvent] = field(default_factory=list)
     target: ProgressionTarget | None = None
     suspect_days: list[tuple[str, date]] = field(default_factory=list)
@@ -1171,6 +1236,18 @@ def build_history(
     result.zones = zone_totals(result.sessions)
     result.recent_zones = zone_totals(result.sessions, recent_from, last)
     result.workouts_with_zones = sum(1 for s in result.sessions if s.zones)
+
+    # FTP is measured rarely and is not one of the curated history metrics, so
+    # read it straight from the daily rows. The most recent value is the right
+    # reference for interpreting power.
+    ftp_by_day = {
+        day: value
+        for day, row in rows_by_date.items()
+        if (value := to_float(row.get('cycling_ftp_w'))) is not None
+    }
+    latest_ftp = ftp_by_day[max(ftp_by_day)] if ftp_by_day else None
+    result.power = power_summary(result.sessions, latest_ftp)
+    result.recent_power = power_summary(result.sessions, latest_ftp, recent_from, last)
 
     load_series = series_by_column.get(ERA_LOAD_COLUMN, {})
     result.eras = segment_eras(
@@ -1384,6 +1461,44 @@ def render_workouts(history: HistoryResult) -> list[str]:
                  'like "Cooldown" or "Other" carrying a large share of minutes is something to '
                  'ask about, not something to score as training.')
     lines.append('')
+    lines.extend(render_power(history))
+    return lines
+
+
+def render_power(history: HistoryResult) -> list[str]:
+    """Cycling power — the only measured intensity in a Health export."""
+    power = history.power
+    if power is None:
+        return []
+
+    lines = ['### Cycling power', '']
+    ftp = f'{power.ftp_w:,.0f} W' if power.ftp_w else 'not recorded'
+    lines.append(
+        f'- {power.sessions} rides with power, {power.minutes:,.0f} min, '
+        f'{power.first.isoformat()}..{power.last.isoformat()}'
+    )
+    lines.append(f'- Duration-weighted average: **{power.avg_w:,.0f} W** — FTP on record: **{ftp}**')
+    if power.pct_of_ftp is not None:
+        lines.append(f'- That is **{power.pct_of_ftp:.0f}% of FTP** across all recorded riding')
+    lines.append(f'- Hardest ride by average power: {power.best_avg_w:,.0f} W on {power.best_day.isoformat()}'
+                 + (f'; highest instantaneous {power.max_w:,.0f} W' if power.max_w else ''))
+
+    recent = history.recent_power
+    if recent is not None and recent.sessions:
+        pct = f' ({recent.pct_of_ftp:.0f}% of FTP)' if recent.pct_of_ftp is not None else ''
+        lines.append(f'- Last 28 days: {recent.sessions} rides, {recent.avg_w:,.0f} W average{pct}')
+    else:
+        lines.append('- No power-recorded riding in the last 28 days')
+
+    lines.extend([
+        '',
+        'Power is measured, not inferred, so it is the most reliable intensity figure available '
+        'here — unlike heart rate it does not drift with heat, caffeine, sleep or stress. Read it '
+        'against FTP: roughly under 55% of FTP is recovery riding, 56-75% endurance, 76-90% tempo, '
+        'above 90% threshold work. FTP itself is only as current as the date it was last measured, '
+        'and an indoor trainer that has never been calibrated can read systematically high or low.',
+        '',
+    ])
     return lines
 
 

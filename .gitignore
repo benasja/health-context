@@ -23,4 +23,9 @@ llm_context.md
 
 # --- Junk ---
 __pycache__/
+.ruff_cache/
 .DS_Store
+
+# Belt-and-braces: the generated filenames above already match at any
+# depth, but a future output would not.
+output/

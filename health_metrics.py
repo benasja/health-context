@@ -11,7 +11,6 @@ percent-valued metric carries scale=100.0 to land in human-readable percent.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
 
 # Aggregations supported by DailyAccumulator.
 #   sum      — add every sample in the day (counts, energy, distance, minutes)
@@ -71,7 +70,7 @@ Q = 'HKQuantityTypeIdentifier'
 C = 'HKCategoryTypeIdentifier'
 
 # The registry. Order here is the order of columns in daily_metrics.csv.
-DAILY_SPECS: List[MetricSpec] = [
+DAILY_SPECS: list[MetricSpec] = [
     # --- Activity -----------------------------------------------------------
     MetricSpec(Q + 'StepCount', 'steps', 'sum', group='activity', label='Steps', round_to=0),
     MetricSpec(Q + 'DistanceWalkingRunning', 'distance_km', 'sum', unit_kind='distance',
@@ -173,7 +172,7 @@ DAILY_SPECS: List[MetricSpec] = [
 ]
 
 # Columns produced outside the registry (sleep, effort, wear, mindfulness).
-DERIVED_DAILY_COLUMNS: List[Tuple[str, str, str]] = [
+DERIVED_DAILY_COLUMNS: list[tuple[str, str, str]] = [
     ('effort_mets_avg', 'effort', 'Average physical effort (METs, time-weighted)'),
     ('effort_moderate_min', 'effort', 'Minutes at >=3 METs'),
     ('effort_vigorous_min', 'effort', 'Minutes at >=6 METs'),
@@ -201,7 +200,7 @@ DERIVED_DAILY_COLUMNS: List[Tuple[str, str, str]] = [
 # HeartRate/cycling samples must stay in memory for workout time-window joins;
 # everything else in the registry is folded into daily buckets during parsing
 # and never retained, which is what keeps a ~1 GB export inside a sane RSS.
-WINDOW_JOIN_TYPES: Set[str] = {
+WINDOW_JOIN_TYPES: set[str] = {
     Q + 'HeartRate',
     Q + 'CyclingPower',
     Q + 'CyclingCadence',
@@ -221,24 +220,24 @@ EFFORT_TYPE = Q + 'PhysicalEffort'
 # them marks every single day as fully worn, which silently defeats the entire
 # point of wear detection. Heart rate, physical effort and stand time all
 # depend on the optical sensor seeing a wrist.
-WEAR_SIGNAL_TYPES: Set[str] = {
+WEAR_SIGNAL_TYPES: set[str] = {
     Q + 'HeartRate',
     Q + 'PhysicalEffort',
     Q + 'AppleStandTime',
 }
 
-SPECIAL_TYPES: Set[str] = {SLEEP_TYPE, STAND_HOUR_TYPE, MINDFUL_TYPE, EFFORT_TYPE}
+SPECIAL_TYPES: set[str] = {SLEEP_TYPE, STAND_HOUR_TYPE, MINDFUL_TYPE, EFFORT_TYPE}
 
-REGISTRY_TYPES: Set[str] = {spec.hk_type for spec in DAILY_SPECS}
+REGISTRY_TYPES: set[str] = {spec.hk_type for spec in DAILY_SPECS}
 
 # Every type the parser cares about at all.
-ALL_PARSED_TYPES: Set[str] = REGISTRY_TYPES | SPECIAL_TYPES | WINDOW_JOIN_TYPES | WEAR_SIGNAL_TYPES
+ALL_PARSED_TYPES: set[str] = REGISTRY_TYPES | SPECIAL_TYPES | WINDOW_JOIN_TYPES | WEAR_SIGNAL_TYPES
 
-SPECS_BY_TYPE: Dict[str, List[MetricSpec]] = {}
+SPECS_BY_TYPE: dict[str, list[MetricSpec]] = {}
 for _spec in DAILY_SPECS:
     SPECS_BY_TYPE.setdefault(_spec.hk_type, []).append(_spec)
 
-COLUMN_META: Dict[str, Tuple[str, str]] = {
+COLUMN_META: dict[str, tuple[str, str]] = {
     spec.column: (spec.group, spec.label or spec.column) for spec in DAILY_SPECS
 }
 for _col, _group, _label in DERIVED_DAILY_COLUMNS:
@@ -247,7 +246,7 @@ for _col, _group, _label in DERIVED_DAILY_COLUMNS:
 # Body composition and fitness markers are measured occasionally, not daily.
 # A blank day means "not measured", not "missing data", so the quality report
 # must not treat them like a dropped continuous stream.
-SPARSE_BY_DESIGN: Set[str] = {
+SPARSE_BY_DESIGN: set[str] = {
     'body_mass_kg', 'body_fat_pct', 'lean_body_mass_kg', 'bmi', 'height_cm',
     'vo2max', 'hr_recovery_1min', 'six_min_walk_m', 'walking_steadiness_pct',
     'afib_burden_pct', 'alcohol_drinks', 'mindful_minutes',
@@ -255,19 +254,19 @@ SPARSE_BY_DESIGN: Set[str] = {
 
 # Columns that should be carried forward when interpolating a "current value"
 # (a weight measured Monday is still your best estimate of Tuesday's weight).
-CARRY_FORWARD: Set[str] = {
+CARRY_FORWARD: set[str] = {
     'body_mass_kg', 'body_fat_pct', 'lean_body_mass_kg', 'bmi', 'height_cm',
     'vo2max', 'walking_steadiness_pct',
 }
 
 
-def daily_column_order() -> List[str]:
+def daily_column_order() -> list[str]:
     """Full ordered column list for daily_metrics.csv."""
     cols = ['date', 'wear_hours', 'wear_class']
     seen = set(cols)
     groups = ['sleep', 'cardio', 'vitals', 'activity', 'effort', 'body', 'mobility',
               'nutrition', 'environment', 'mind', 'other', 'quality']
-    ordered: Dict[str, List[str]] = {g: [] for g in groups}
+    ordered: dict[str, list[str]] = {g: [] for g in groups}
 
     for spec in DAILY_SPECS:
         ordered.setdefault(spec.group, []).append(spec.column)

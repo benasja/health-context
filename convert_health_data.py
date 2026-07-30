@@ -116,7 +116,7 @@ def parse_ecg_legacy(ecg_dir: str, legacy_rows: list, seen_keys: set) -> int:
 
     for filepath in ecg_files:
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(filepath, encoding='utf-8') as f:
                 lines = [line.strip() for i, line in enumerate(f) if i <= 10]
             metadata = {}
             for line in lines:

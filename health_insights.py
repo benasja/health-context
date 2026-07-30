@@ -15,7 +15,8 @@ import os
 import statistics
 from collections import defaultdict
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Sequence
 
 from health_metrics import CARRY_FORWARD
 
@@ -49,15 +50,15 @@ ILLNESS_MIN_SIGNALS = 2
 # Small statistics helpers
 # ---------------------------------------------------------------------------
 
-def mean(values: Sequence[float]) -> Optional[float]:
+def mean(values: Sequence[float]) -> float | None:
     return statistics.mean(values) if values else None
 
 
-def stdev(values: Sequence[float]) -> Optional[float]:
+def stdev(values: Sequence[float]) -> float | None:
     return statistics.pstdev(values) if len(values) > 1 else None
 
 
-def pearson(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
+def pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
     n = len(xs)
     if n < 3:
         return None
@@ -66,23 +67,33 @@ def pearson(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
     syy = sum((y - my) ** 2 for y in ys)
     if sxx <= 0 or syy <= 0:
         return None
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
     return sxy / math.sqrt(sxx * syy)
 
 
-def correlation_t(r: float, n: int) -> Optional[float]:
+def correlation_t(r: float, n: int) -> float | None:
     """t statistic for a correlation; |t| > 2 is roughly p < 0.05."""
     if n < 3 or abs(r) >= 1.0:
         return None
     return r * math.sqrt((n - 2) / (1 - r * r))
 
 
-def circular_stats(hours: Sequence[float]) -> Optional[Tuple[float, float]]:
+# Circular SD grows without bound as times approach a uniform spread around the
+# clock, so it is capped. Anything near this is already "as irregular as it gets".
+MAX_CIRCULAR_SD_HOURS = 6.0
+
+
+def circular_stats(hours: Sequence[float]) -> tuple[float, float] | None:
     """Mean and SD of clock times, in hours.
 
     Sleep midpoints straddle midnight (23.8 and 0.2 are 24 minutes apart, not
     23.6 hours), so a plain mean/SD would be meaningless. Treats each time as an
     angle on a 24-hour circle.
+
+    Times spread evenly around the clock produce a near-zero resultant vector.
+    That is *maximum* dispersion, not absent data, so it reports the cap rather
+    than returning None — otherwise the most irregular sleeper possible would
+    show a blank instead of a warning.
     """
     if len(hours) < 2:
         return None
@@ -90,12 +101,13 @@ def circular_stats(hours: Sequence[float]) -> Optional[Tuple[float, float]]:
     c = statistics.mean(math.cos(a) for a in angles)
     s = statistics.mean(math.sin(a) for a in angles)
     r = math.hypot(c, s)
+
+    mean_hour = (math.atan2(s, c) % (2 * math.pi)) * 24.0 / (2 * math.pi)
     if r <= 1e-9:
-        return None
-    mean_angle = math.atan2(s, c) % (2 * math.pi)
-    mean_hour = mean_angle * 24.0 / (2 * math.pi)
+        return mean_hour, MAX_CIRCULAR_SD_HOURS
+
     sd_hours = math.sqrt(max(-2.0 * math.log(min(r, 1.0)), 0.0)) * 24.0 / (2 * math.pi)
-    return mean_hour, sd_hours
+    return mean_hour, min(sd_hours, MAX_CIRCULAR_SD_HOURS)
 
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -106,7 +118,7 @@ def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 # Series handling
 # ---------------------------------------------------------------------------
 
-def to_float(value: Any) -> Optional[float]:
+def to_float(value: Any) -> float | None:
     if value in ('', None):
         return None
     try:
@@ -115,8 +127,8 @@ def to_float(value: Any) -> Optional[float]:
         return None
 
 
-def build_series(rows: List[Dict[str, Any]], column: str) -> Dict[date, float]:
-    out: Dict[date, float] = {}
+def build_series(rows: list[dict[str, Any]], column: str) -> dict[date, float]:
+    out: dict[date, float] = {}
     for row in rows:
         val = to_float(row.get(column))
         if val is not None:
@@ -124,12 +136,12 @@ def build_series(rows: List[Dict[str, Any]], column: str) -> Dict[date, float]:
     return out
 
 
-def carry_forward(series: Dict[date, float], dates: List[date], max_gap_days: int = 45) -> Dict[date, float]:
+def carry_forward(series: dict[date, float], dates: list[date], max_gap_days: int = 45) -> dict[date, float]:
     """Hold the last measurement forward — a weight taken Monday is still the
     best estimate for Tuesday — but not indefinitely past a long gap."""
-    out: Dict[date, float] = {}
-    last_val: Optional[float] = None
-    last_day: Optional[date] = None
+    out: dict[date, float] = {}
+    last_val: float | None = None
+    last_day: date | None = None
     for d in dates:
         if d in series:
             last_val, last_day = series[d], d
@@ -139,17 +151,17 @@ def carry_forward(series: Dict[date, float], dates: List[date], max_gap_days: in
 
 
 def rolling_baseline(
-    series: Dict[date, float],
-    dates: List[date],
+    series: dict[date, float],
+    dates: list[date],
     window: int = BASELINE_WINDOW,
     min_n: int = BASELINE_MIN_N,
-) -> Dict[date, Tuple[float, Optional[float]]]:
+) -> dict[date, tuple[float, float | None]]:
     """Trailing mean/SD over `window` days, excluding the day itself.
 
     Excluding the current day matters: a baseline that contains today's value
     partly cancels the deviation it is supposed to measure.
     """
-    out: Dict[date, Tuple[float, Optional[float]]] = {}
+    out: dict[date, tuple[float, float | None]] = {}
     for d in dates:
         history = [
             series[d - timedelta(days=k)]
@@ -161,7 +173,7 @@ def rolling_baseline(
     return out
 
 
-def rolling_mean(series: Dict[date, float], day: date, days: int) -> Optional[float]:
+def rolling_mean(series: dict[date, float], day: date, days: int) -> float | None:
     vals = [series[day - timedelta(days=k)] for k in range(days) if (day - timedelta(days=k)) in series]
     return statistics.mean(vals) if vals else None
 
@@ -176,7 +188,7 @@ def z_to_score(z: float, worse_when_high: bool) -> float:
     return clamp(70.0 + directed * 15.0)
 
 
-def recovery_score(parts: Dict[str, Optional[float]]) -> Tuple[Optional[float], List[str]]:
+def recovery_score(parts: dict[str, float | None]) -> tuple[float | None, list[str]]:
     """Transparent weighted blend of recovery signals, 0-100.
 
     Weights are a judgement call, not a validated instrument — the component
@@ -191,7 +203,7 @@ def recovery_score(parts: Dict[str, Optional[float]]) -> Tuple[Optional[float], 
     }
     total_w = 0.0
     total = 0.0
-    used: List[str] = []
+    used: list[str] = []
     for key, weight in weights.items():
         val = parts.get(key)
         if val is None:
@@ -204,14 +216,14 @@ def recovery_score(parts: Dict[str, Optional[float]]) -> Tuple[Optional[float], 
     return round(total / total_w, 1), used
 
 
-def illness_signals(row: Dict[str, Any]) -> List[str]:
+def illness_signals(row: dict[str, Any]) -> list[str]:
     """Multi-signal physiological strain check.
 
     Any one of these moves on its own for boring reasons (a hard workout, a warm
     room, a late meal). Consumer wearables treat *simultaneous* movement across
     several as the meaningful pattern, so this only reports the combination.
     """
-    signals: List[str] = []
+    signals: list[str] = []
 
     temp_dev = to_float(row.get('wrist_temp_c_dev'))
     if temp_dev is not None and temp_dev >= 0.4:
@@ -243,9 +255,9 @@ def illness_signals(row: Dict[str, Any]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def build_daily_insights(
-    daily_rows: List[Dict[str, Any]],
-    start: Optional[date] = None,
-) -> List[Dict[str, Any]]:
+    daily_rows: list[dict[str, Any]],
+    start: date | None = None,
+) -> list[dict[str, Any]]:
     rows = [r for r in daily_rows if not start or date.fromisoformat(r['date']) >= start]
     if not rows:
         return []
@@ -257,9 +269,9 @@ def build_daily_insights(
     load_series = build_series(rows, 'exercise_minutes')
     midpoint_series = build_series(rows, 'sleep_midpoint_hour')
 
-    out: List[Dict[str, Any]] = []
-    for row, d in zip(rows, dates):
-        rec: Dict[str, Any] = {'date': row['date'], 'wear_class': row.get('wear_class', 'none')}
+    out: list[dict[str, Any]] = []
+    for row, d in zip(rows, dates, strict=True):
+        rec: dict[str, Any] = {'date': row['date'], 'wear_class': row.get('wear_class', 'none')}
 
         for col in BASELINE_METRICS:
             value = series[col].get(d)
@@ -275,7 +287,7 @@ def build_daily_insights(
             rec[f'{col}_z'] = round((value - mu) / sd, 2) if sd and sd > 0 else ''
 
         # --- recovery components
-        parts: Dict[str, Optional[float]] = {}
+        parts: dict[str, float | None] = {}
         hrv_z = to_float(rec.get('hrv_sdnn_z'))
         if hrv_z is not None:
             parts['hrv'] = z_to_score(hrv_z, worse_when_high=False)
@@ -366,12 +378,12 @@ MIN_PAIRS = 30
 
 
 def analyse_associations(
-    daily_rows: List[Dict[str, Any]],
-    start: Optional[date],
+    daily_rows: list[dict[str, Any]],
+    start: date | None,
     min_pairs: int = MIN_PAIRS,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     rows = [r for r in daily_rows if not start or date.fromisoformat(r['date']) >= start]
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for driver, outcome, lag, label in ASSOCIATIONS:
         ds = build_series(rows, driver)
@@ -407,13 +419,13 @@ def analyse_associations(
 
 
 def threshold_contrast(
-    daily_rows: List[Dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
     driver: str,
     outcome: str,
     threshold: float,
     lag: int,
-    start: Optional[date],
-) -> Optional[Dict[str, Any]]:
+    start: date | None,
+) -> dict[str, Any] | None:
     """Compare the outcome on days following a low vs high driver value.
 
     Often more legible than a correlation coefficient: "nights under 6h cost you
@@ -422,8 +434,8 @@ def threshold_contrast(
     rows = [r for r in daily_rows if not start or date.fromisoformat(r['date']) >= start]
     ds = build_series(rows, driver)
     os_ = build_series(rows, outcome)
-    low: List[float] = []
-    high: List[float] = []
+    low: list[float] = []
+    high: list[float] = []
     for d, v in ds.items():
         target = os_.get(d + timedelta(days=lag))
         if target is None:
@@ -482,11 +494,11 @@ MIN_MEASUREMENTS_FOR_TREND = 3
 
 
 def compute_trends(
-    daily_rows: List[Dict[str, Any]],
-    start: Optional[date],
+    daily_rows: list[dict[str, Any]],
+    start: date | None,
     recent_days: int = 30,
     prior_days: int = 90,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Recent vs prior period comparison, plus the trends deliberately withheld.
 
     Carry-forward is what makes this dangerous: holding a weigh-in forward turns
@@ -503,8 +515,8 @@ def compute_trends(
     recent_from = last_day - timedelta(days=recent_days)
     prior_from = recent_from - timedelta(days=prior_days)
 
-    out: List[Dict[str, Any]] = []
-    withheld: List[Dict[str, str]] = []
+    out: list[dict[str, Any]] = []
+    withheld: list[dict[str, str]] = []
 
     for col, unit, higher_better in TREND_METRICS:
         measured = build_series(rows, col)
@@ -564,16 +576,15 @@ def _fmt(value: Any, suffix: str = '') -> str:
 
 
 def render_insights_report(
-    daily_rows: List[Dict[str, Any]],
-    insight_rows: List[Dict[str, Any]],
-    trends: List[Dict[str, Any]],
-    associations: List[Dict[str, Any]],
-    contrasts: List[Dict[str, Any]],
-    start: Optional[date],
-    coverage: List[Dict[str, Any]],
-    withheld_trends: Optional[List[Dict[str, str]]] = None,
+    insight_rows: list[dict[str, Any]],
+    trends: list[dict[str, Any]],
+    associations: list[dict[str, Any]],
+    contrasts: list[dict[str, Any]],
+    start: date | None,
+    coverage: list[dict[str, Any]],
+    withheld_trends: list[dict[str, str]] | None = None,
 ) -> str:
-    lines: List[str] = ['# Health insights', '']
+    lines: list[str] = ['# Health insights', '']
     if start:
         lines.append(f'Analysis window opens **{start.isoformat()}**, the first date on which the '
                      'continuously-tracked core metrics (resting HR, HRV, staged sleep) are all live. '
@@ -731,11 +742,11 @@ def render_insights_report(
 
 
 def render_llm_context(
-    daily_rows: List[Dict[str, Any]],
-    insight_rows: List[Dict[str, Any]],
-    trends: List[Dict[str, Any]],
-    associations: List[Dict[str, Any]],
-    start: Optional[date],
+    daily_rows: list[dict[str, Any]],
+    insight_rows: list[dict[str, Any]],
+    trends: list[dict[str, Any]],
+    associations: list[dict[str, Any]],
+    start: date | None,
     recent_days: int = 28,
 ) -> str:
     """A compact, pre-analysed brief to paste into an LLM.
@@ -810,10 +821,10 @@ def render_llm_context(
 
 def write_insight_outputs(
     base_dir: str,
-    daily_rows: List[Dict[str, Any]],
-    coverage: List[Dict[str, Any]],
-    start: Optional[date],
-) -> Dict[str, str]:
+    daily_rows: list[dict[str, Any]],
+    coverage: list[dict[str, Any]],
+    start: date | None,
+) -> dict[str, str]:
     insight_rows = build_daily_insights(daily_rows, start)
     trends, withheld_trends = compute_trends(daily_rows, start)
     associations = analyse_associations(daily_rows, start)
@@ -836,7 +847,7 @@ def write_insight_outputs(
         writer.writerows(insight_rows)
 
     with open(paths['insights_report'], 'w', encoding='utf-8') as f:
-        f.write(render_insights_report(daily_rows, insight_rows, trends, associations,
+        f.write(render_insights_report(insight_rows, trends, associations,
                                        contrasts, start, coverage, withheld_trends))
 
     with open(paths['llm_context'], 'w', encoding='utf-8') as f:

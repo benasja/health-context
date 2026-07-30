@@ -1,0 +1,29 @@
+# Lint config for the Apple Health converter.
+#
+#   pip install ruff && ruff check .
+#
+# The project is stdlib-only; ruff is a development dependency, never a runtime one.
+
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "B", "SIM", "UP", "C4", "RET", "ARG", "PIE", "PERF"]
+
+ignore = [
+    # Report builders append one formatted line at a time. Rewriting those loops
+    # as list.extend(comprehension) would obscure the output being constructed
+    # for no measurable gain on lists of a few dozen strings.
+    "PERF401",
+    # ProgressFile deliberately owns a long-lived file handle: it is a read()
+    # wrapper handed to ElementTree.iterparse and closed in a finally block, so
+    # a `with` statement cannot express its lifetime.
+    "SIM115",
+    # Returning a named local reads better than inlining the expression when the
+    # name documents what the value is.
+    "RET504",
+]
+
+[lint.per-file-ignores]
+# Tests build fixture rows in explicit loops for readability.
+"test_health.py" = ["PERF401"]

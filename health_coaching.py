@@ -7,6 +7,7 @@ and the legacy flat CSV stay in memory.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import os
@@ -17,7 +18,8 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any
+from collections.abc import Iterable
 
 from health_metrics import (
     ALL_PARSED_TYPES,
@@ -117,7 +119,7 @@ WEAR_PARTIAL_HOURS = 8
 @dataclass(slots=True)
 class HealthRecord:
     type: str
-    value: Optional[float]
+    value: float | None
     category_value: str
     unit: str
     source_name: str
@@ -136,15 +138,15 @@ class Workout:
     start_raw: str
     end_raw: str
     creation: str
-    duration: Optional[float]
+    duration: float | None
     duration_unit: str
-    total_energy: Optional[float]
+    total_energy: float | None
     total_energy_unit: str
-    total_distance: Optional[float]
+    total_distance: float | None
     total_distance_unit: str
     source_name: str
-    statistics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    metadata: Dict[str, str] = field(default_factory=dict)
+    statistics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 def normalize_source(name: str) -> str:
@@ -165,21 +167,20 @@ class DailyAccumulator:
     """Folds samples into per-day aggregates without retaining the samples."""
 
     def __init__(self) -> None:
-        self._sum: Dict[Tuple[date, str], float] = defaultdict(float)
-        self._count: Dict[Tuple[date, str], int] = defaultdict(int)
-        self._min: Dict[Tuple[date, str], float] = {}
-        self._max: Dict[Tuple[date, str], float] = {}
-        self._latest: Dict[Tuple[date, str], Tuple[datetime, float]] = {}
-        self.days: Set[date] = set()
+        self._sum: dict[tuple[date, str], float] = defaultdict(float)
+        self._count: dict[tuple[date, str], int] = defaultdict(int)
+        self._min: dict[tuple[date, str], float] = {}
+        self._max: dict[tuple[date, str], float] = {}
+        self._latest: dict[tuple[date, str], tuple[datetime, float]] = {}
+        self.days: set[date] = set()
 
     def add(self, day: date, column: str, agg: str, value: float,
-            when: Optional[datetime] = None) -> None:
+            when: datetime | None = None) -> None:
         self.days.add(day)
         key = (day, column)
-        if agg == 'sum':
-            self._sum[key] += value
-            self._count[key] += 1
-        elif agg == 'mean':
+        if agg in ('sum', 'mean'):
+            # Both need the running total and the count; which one is read back
+            # is decided in get().
             self._sum[key] += value
             self._count[key] += 1
         elif agg == 'min':
@@ -196,13 +197,15 @@ class DailyAccumulator:
             if prev is None or stamp > prev[0]:
                 self._latest[key] = (stamp, value)
 
-    def get(self, day: date, column: str, agg: str) -> Optional[float]:
+    def get(self, day: date, column: str, agg: str) -> float | None:
         key = (day, column)
+        # .get() rather than [] throughout: _sum is a defaultdict, so indexing a
+        # missing key would silently create it.
         if agg == 'sum':
-            return self._sum[key] if key in self._sum else None
+            return self._sum.get(key)
         if agg == 'mean':
             n = self._count.get(key, 0)
-            return self._sum[key] / n if n else None
+            return self._sum.get(key, 0.0) / n if n else None
         if agg == 'min':
             return self._min.get(key)
         if agg == 'max':
@@ -217,7 +220,7 @@ class WearTracker:
     """Counts distinct clock hours per day that carry a watch-sourced sample."""
 
     def __init__(self) -> None:
-        self.hours: Dict[date, Set[int]] = defaultdict(set)
+        self.hours: dict[date, set[int]] = defaultdict(set)
 
     def mark(self, start: datetime, end: datetime) -> None:
         day = start.date()
@@ -225,9 +228,8 @@ class WearTracker:
         # A sample can span an hour boundary; credit the end hour too, but never
         # let a single long record (e.g. a multi-hour basal-energy roll-up)
         # paint an entire day as "worn".
-        if end > start and (end - start) <= timedelta(hours=2):
-            if end.date() == day:
-                self.hours[day].add(end.hour)
+        if start < end <= start + timedelta(hours=2) and end.date() == day:
+            self.hours[day].add(end.hour)
 
     def wear_hours(self, day: date) -> int:
         return len(self.hours.get(day, ()))
@@ -247,10 +249,10 @@ class EffortTracker:
     """Time-weighted METs plus moderate/vigorous minutes from PhysicalEffort."""
 
     def __init__(self) -> None:
-        self.weighted: Dict[date, float] = defaultdict(float)
-        self.minutes: Dict[date, float] = defaultdict(float)
-        self.moderate: Dict[date, float] = defaultdict(float)
-        self.vigorous: Dict[date, float] = defaultdict(float)
+        self.weighted: dict[date, float] = defaultdict(float)
+        self.minutes: dict[date, float] = defaultdict(float)
+        self.moderate: dict[date, float] = defaultdict(float)
+        self.vigorous: dict[date, float] = defaultdict(float)
 
     def add(self, day: date, mets: float, start: datetime, end: datetime) -> None:
         span = (end - start).total_seconds() / 60.0
@@ -266,7 +268,7 @@ class EffortTracker:
         elif mets >= MODERATE_METS:
             self.moderate[day] += span
 
-    def average(self, day: date) -> Optional[float]:
+    def average(self, day: date) -> float | None:
         mins = self.minutes.get(day, 0.0)
         return self.weighted[day] / mins if mins else None
 
@@ -274,18 +276,18 @@ class EffortTracker:
 @dataclass
 class ExportData:
     type_counts: Counter = field(default_factory=Counter)
-    records: List[HealthRecord] = field(default_factory=list)
-    workouts: List[Workout] = field(default_factory=list)
-    seen_record_keys: Set[int] = field(default_factory=set)
+    records: list[HealthRecord] = field(default_factory=list)
+    workouts: list[Workout] = field(default_factory=list)
+    seen_record_keys: set[int] = field(default_factory=set)
     timezone_label: str = ''
     daily: DailyAccumulator = field(default_factory=DailyAccumulator)
     wear: WearTracker = field(default_factory=WearTracker)
     effort: EffortTracker = field(default_factory=EffortTracker)
-    stand_hours: Dict[date, int] = field(default_factory=lambda: defaultdict(int))
-    mindful_minutes: Dict[date, float] = field(default_factory=lambda: defaultdict(float))
-    first_seen: Dict[str, date] = field(default_factory=dict)
+    stand_hours: dict[date, int] = field(default_factory=lambda: defaultdict(int))
+    mindful_minutes: dict[date, float] = field(default_factory=lambda: defaultdict(float))
+    first_seen: dict[str, date] = field(default_factory=dict)
     sources: Counter = field(default_factory=Counter)
-    metric_sources: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    metric_sources: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
 
     def mark_seen(self, *parts: str) -> bool:
         """True if this record was already ingested.
@@ -300,7 +302,7 @@ class ExportData:
         return False
 
 
-def parse_health_datetime(raw: str) -> Optional[datetime]:
+def parse_health_datetime(raw: str) -> datetime | None:
     if not raw:
         return None
     raw = raw.strip()
@@ -324,7 +326,7 @@ def local_calendar_date(dt: datetime) -> date:
     return dt.date()
 
 
-def parse_float(value: str) -> Optional[float]:
+def parse_float(value: str) -> float | None:
     if value is None or value == '':
         return None
     try:
@@ -333,7 +335,7 @@ def parse_float(value: str) -> Optional[float]:
         return None
 
 
-def energy_to_kcal(amount: Optional[float], unit: str) -> Optional[float]:
+def energy_to_kcal(amount: float | None, unit: str) -> float | None:
     if amount is None:
         return None
     u = (unit or '').lower()
@@ -342,7 +344,7 @@ def energy_to_kcal(amount: Optional[float], unit: str) -> Optional[float]:
     return amount
 
 
-def distance_to_km(amount: Optional[float], unit: str) -> Optional[float]:
+def distance_to_km(amount: float | None, unit: str) -> float | None:
     if amount is None:
         return None
     u = (unit or '').lower()
@@ -353,7 +355,7 @@ def distance_to_km(amount: Optional[float], unit: str) -> Optional[float]:
     return amount
 
 
-def duration_to_minutes(amount: Optional[float], unit: str) -> Optional[float]:
+def duration_to_minutes(amount: float | None, unit: str) -> float | None:
     if amount is None:
         return None
     u = (unit or 'min').lower()
@@ -378,7 +380,7 @@ def workout_id_for(workout: Workout) -> str:
     return hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
 
 
-def infer_timezone_label(records: List[HealthRecord], workouts: List[Workout]) -> str:
+def infer_timezone_label(records: list[HealthRecord], workouts: list[Workout]) -> str:
     for item in list(records[:50]) + [None]:
         raw = item.start_raw if item else ''
         if not raw:
@@ -398,7 +400,7 @@ def infer_timezone_label(records: List[HealthRecord], workouts: List[Workout]) -
 # summing the export's records inflates the totals badly (~35% on step counts
 # for a user who carries both). Apple Health itself de-duplicates by time
 # window before showing a number; these need the same treatment.
-DEDUP_INTERVAL_TYPES: Dict[str, str] = {
+DEDUP_INTERVAL_TYPES: dict[str, str] = {
     'HKQuantityTypeIdentifierStepCount': 'steps',
     'HKQuantityTypeIdentifierDistanceWalkingRunning': 'distance_km',
     'HKQuantityTypeIdentifierFlightsClimbed': 'flights_climbed',
@@ -408,7 +410,7 @@ DEDUP_INTERVAL_TYPES: Dict[str, str] = {
 # Metrics logged as instantaneous entries rather than intervals, where two apps
 # mirroring the same meals would double the day's total. Interval logic cannot
 # help here (a meal has no duration), so one source wins the whole day.
-DEDUP_PRIMARY_TYPES: Dict[str, str] = {
+DEDUP_PRIMARY_TYPES: dict[str, str] = {
     'HKQuantityTypeIdentifierDietaryEnergyConsumed': 'diet_kcal',
     'HKQuantityTypeIdentifierDietaryProtein': 'diet_protein_g',
     'HKQuantityTypeIdentifierDietaryCarbohydrates': 'diet_carbs_g',
@@ -429,9 +431,9 @@ def source_priority(name: str) -> int:
     return 2
 
 
-def _merge_intervals(spans: List[Tuple[datetime, datetime]]) -> List[Tuple[datetime, datetime]]:
+def _merge_intervals(spans: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
     spans.sort()
-    merged: List[Tuple[datetime, datetime]] = []
+    merged: list[tuple[datetime, datetime]] = []
     for start, end in spans:
         if merged and start <= merged[-1][1]:
             if end > merged[-1][1]:
@@ -442,8 +444,8 @@ def _merge_intervals(spans: List[Tuple[datetime, datetime]]) -> List[Tuple[datet
 
 
 def _intersects(
-    merged: List[Tuple[datetime, datetime]],
-    starts: List[datetime],
+    merged: list[tuple[datetime, datetime]],
+    starts: list[datetime],
     start: datetime,
     end: datetime,
 ) -> bool:
@@ -468,10 +470,10 @@ def _intersects(
 
 
 def dedup_interval_sum(
-    records: List[HealthRecord],
+    records: list[HealthRecord],
     hk_type: str,
     convert,
-) -> Dict[date, float]:
+) -> dict[date, float]:
     """Per-day total counting each stretch of time only once.
 
     Sources are taken best-first (watch, then phone, then anything else). A
@@ -479,27 +481,27 @@ def dedup_interval_sum(
     higher-priority device, so a phone still contributes during hours the watch
     was off the wrist instead of being discarded wholesale.
     """
-    by_day: Dict[date, List[HealthRecord]] = defaultdict(list)
+    by_day: dict[date, list[HealthRecord]] = defaultdict(list)
     for rec in records:
         if rec.type == hk_type and rec.value is not None:
             by_day[local_calendar_date(rec.start)].append(rec)
 
-    totals: Dict[date, float] = {}
+    totals: dict[date, float] = {}
     for day, recs in by_day.items():
         # Each distinct source is its own tier: a device renamed mid-history
         # ("Benas iPhone" -> "Benas's iPhone") never overlaps itself, but two
         # genuinely different apps do.
-        by_source: Dict[str, List[HealthRecord]] = defaultdict(list)
+        by_source: dict[str, list[HealthRecord]] = defaultdict(list)
         for rec in recs:
             by_source[normalize_source(rec.source_name)].append(rec)
 
         order = sorted(by_source, key=lambda s: (source_priority(s), -len(by_source[s]), s))
-        merged: List[Tuple[datetime, datetime]] = []
-        starts: List[datetime] = []
+        merged: list[tuple[datetime, datetime]] = []
+        starts: list[datetime] = []
         total = 0.0
 
         for source in order:
-            accepted: List[Tuple[datetime, datetime]] = []
+            accepted: list[tuple[datetime, datetime]] = []
             for rec in sorted(by_source[source], key=lambda r: r.start):
                 if _intersects(merged, starts, rec.start, rec.end):
                     continue
@@ -514,17 +516,17 @@ def dedup_interval_sum(
 
 
 def dedup_primary_sum(
-    records: List[HealthRecord],
+    records: list[HealthRecord],
     hk_type: str,
     convert,
-) -> Dict[date, float]:
+) -> dict[date, float]:
     """Per-day total from whichever single source logged the most that day."""
-    by_day: Dict[date, Dict[str, List[HealthRecord]]] = defaultdict(lambda: defaultdict(list))
+    by_day: dict[date, dict[str, list[HealthRecord]]] = defaultdict(lambda: defaultdict(list))
     for rec in records:
         if rec.type == hk_type and rec.value is not None:
             by_day[local_calendar_date(rec.start)][normalize_source(rec.source_name)].append(rec)
 
-    totals: Dict[date, float] = {}
+    totals: dict[date, float] = {}
     for day, sources in by_day.items():
         best = max(sources, key=lambda s: (len(sources[s]), -source_priority(s)))
         totals[day] = sum(convert(r.value, r.unit) for r in sources[best])
@@ -656,7 +658,7 @@ class ProgressFile:
     def close(self) -> None:
         self._f.close()
 
-    def __enter__(self) -> 'ProgressFile':
+    def __enter__(self) -> ProgressFile:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -671,7 +673,7 @@ def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True)
     print(f"Processing: {filepath} ({size_mb:,.0f} MB)")
     added = 0
 
-    progress: Optional[ProgressFile] = None
+    progress: ProgressFile | None = None
     parse_source: Any = filepath
     if show_progress:
         progress = ProgressFile(filepath, label=os.path.basename(filepath))
@@ -724,8 +726,8 @@ def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True)
             elif elem.tag == 'Workout':
                 data.type_counts[f"Workout:{elem.get('workoutActivityType', '')}"] += 1
 
-                stats: Dict[str, Dict[str, Any]] = {}
-                metadata: Dict[str, str] = {}
+                stats: dict[str, dict[str, Any]] = {}
+                metadata: dict[str, str] = {}
                 for child in elem:
                     if child.tag == 'WorkoutStatistics':
                         stype = child.get('type') or ''
@@ -796,8 +798,8 @@ SLEEP_SESSION_GAP_MINUTES = 90.0
 
 
 def _cluster_sleep_sessions(
-    segments: List[Tuple[datetime, datetime, str]],
-) -> List[List[Tuple[datetime, datetime, str]]]:
+    segments: list[tuple[datetime, datetime, str]],
+) -> list[list[tuple[datetime, datetime, str]]]:
     """Split one source's segments into distinct sleep sessions.
 
     Bucketing raw segments by calendar date does not work: a stretch of sleep
@@ -807,9 +809,9 @@ def _cluster_sleep_sessions(
     a doubled duration. Grouping by continuity first, then dating each session by
     when it ended, keeps every night intact.
     """
-    sessions: List[List[Tuple[datetime, datetime, str]]] = []
-    current: List[Tuple[datetime, datetime, str]] = []
-    current_end: Optional[datetime] = None
+    sessions: list[list[tuple[datetime, datetime, str]]] = []
+    current: list[tuple[datetime, datetime, str]] = []
+    current_end: datetime | None = None
 
     for seg in sorted(segments, key=lambda x: x[0]):
         start, end, _label = seg
@@ -828,7 +830,7 @@ def _cluster_sleep_sessions(
     return sessions
 
 
-def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, Any]]:
+def aggregate_sleep_by_day(records: list[HealthRecord]) -> dict[date, dict[str, Any]]:
     """Per-night sleep totals, stages, timing and efficiency.
 
     Segments are first grouped per source into continuous sessions, then each
@@ -845,8 +847,8 @@ def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, 
     sleep but carries no stage. That remainder is surfaced separately as
     sleep_unspecified_hours rather than quietly breaking the arithmetic.
     """
-    by_source: Dict[str, List[Tuple[datetime, datetime, str]]] = defaultdict(list)
-    seen: Set[Tuple] = set()
+    by_source: dict[str, list[tuple[datetime, datetime, str]]] = defaultdict(list)
+    seen: set[tuple] = set()
 
     for rec in records:
         if rec.type != SLEEP_TYPE:
@@ -861,7 +863,7 @@ def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, 
         seen.add(key)
         by_source[source].append((rec.start, rec.end, label))
 
-    candidates: Dict[date, List[Tuple[bool, float, str, List]]] = defaultdict(list)
+    candidates: dict[date, list[tuple[bool, float, str, list]]] = defaultdict(list)
     for source, segments in by_source.items():
         for session in _cluster_sleep_sessions(segments):
             asleep = sum(_hours(s, e) for s, e, lbl in session if lbl in ASLEEP_STAGES)
@@ -871,16 +873,16 @@ def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, 
             wake_day = local_calendar_date(max(e for _s, e, _l in session))
             candidates[wake_day].append((staged, asleep, source, session))
 
-    result: Dict[date, Dict[str, Any]] = {}
+    result: dict[date, dict[str, Any]] = {}
     for day, options in candidates.items():
         staged, _asleep, source, session = max(options, key=lambda o: (o[0], o[1]))
         result[day] = _summarize_night(session, source)
     return result
 
 
-def _summarize_night(segments: List[Tuple[datetime, datetime, str]], source: str) -> Dict[str, Any]:
+def _summarize_night(segments: list[tuple[datetime, datetime, str]], source: str) -> dict[str, Any]:
     totals = defaultdict(float)
-    asleep_spans: List[Tuple[datetime, datetime]] = []
+    asleep_spans: list[tuple[datetime, datetime]] = []
     awake_count = 0
 
     for start, end, label in segments:
@@ -904,7 +906,7 @@ def _summarize_night(segments: List[Tuple[datetime, datetime, str]], source: str
 
     asleep_total = totals['rem'] + totals['core'] + totals['deep'] + totals['unspecified']
 
-    night: Dict[str, Any] = {
+    night: dict[str, Any] = {
         'source': source,
         'in_bed': totals['in_bed'],
         'asleep': asleep_total,
@@ -938,9 +940,9 @@ def _summarize_night(segments: List[Tuple[datetime, datetime, str]], source: str
 # Daily assembly
 # ---------------------------------------------------------------------------
 
-def build_daily_metrics(data: ExportData) -> Tuple[List[Dict[str, Any]], Set[str], Set[str]]:
-    used_types: Set[str] = set()
-    missing_types: Set[str] = set()
+def build_daily_metrics(data: ExportData) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    used_types: set[str] = set()
+    missing_types: set[str] = set()
 
     sleep_by_day = aggregate_sleep_by_day(data.records)
 
@@ -948,7 +950,7 @@ def build_daily_metrics(data: ExportData) -> Tuple[List[Dict[str, Any]], Set[str
     # totals. Without this, steps/distance/energy are inflated by however much
     # the phone and watch overlap.
     spec_by_column = {spec.column: spec for spec in DAILY_SPECS}
-    deduped: Dict[str, Dict[date, float]] = {}
+    deduped: dict[str, dict[date, float]] = {}
     for hk_type, column in DEDUP_INTERVAL_TYPES.items():
         spec = spec_by_column.get(column)
         if spec is not None:
@@ -958,15 +960,15 @@ def build_daily_metrics(data: ExportData) -> Tuple[List[Dict[str, Any]], Set[str
         if spec is not None:
             deduped[column] = dedup_primary_sum(data.records, hk_type, spec.convert)
 
-    all_days: Set[date] = set(data.daily.days) | set(sleep_by_day.keys())
+    all_days: set[date] = set(data.daily.days) | set(sleep_by_day.keys())
     all_days |= set(data.stand_hours.keys()) | set(data.effort.minutes.keys())
     all_days |= set(data.mindful_minutes.keys()) | set(data.wear.hours.keys())
 
     rounding = {spec.column: spec.round_to for spec in DAILY_SPECS}
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for day in sorted(all_days):
-        row: Dict[str, Any] = {'date': day.isoformat()}
+        row: dict[str, Any] = {'date': day.isoformat()}
 
         wear_hours = data.wear.wear_hours(day)
         row['wear_hours'] = wear_hours
@@ -1026,11 +1028,11 @@ def build_daily_metrics(data: ExportData) -> Tuple[List[Dict[str, Any]], Set[str
 # ---------------------------------------------------------------------------
 
 def detect_coverage(
-    daily_rows: List[Dict[str, Any]],
-    columns: List[str],
+    daily_rows: list[dict[str, Any]],
+    columns: list[str],
     window: int = 28,
     density: float = 0.5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Find, per column, the date after which the metric is genuinely tracked.
 
     A new watch backfills nothing, so a metric's first sample is its true start —
@@ -1043,7 +1045,7 @@ def detect_coverage(
     if not dates:
         return []
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for col in columns:
         present = [i for i, r in enumerate(daily_rows) if r.get(col) not in ('', None)]
         if not present:
@@ -1058,9 +1060,15 @@ def detect_coverage(
             cursor = first
             end = last
             while cursor <= end:
-                hits = sum(1 for k in range(window) if (cursor + timedelta(days=k)) in present_dates)
-                if hits >= window * density:
-                    break
+                # The window only needs `density` of its days filled, so without
+                # also requiring the cursor itself to carry a measurement the
+                # reported start can precede the metric's first sample by up to
+                # half the window.
+                if cursor in present_dates:
+                    hits = sum(1 for k in range(window)
+                               if (cursor + timedelta(days=k)) in present_dates)
+                    if hits >= window * density:
+                        break
                 cursor += timedelta(days=1)
             reliable = cursor if cursor <= end else first
 
@@ -1081,7 +1089,7 @@ def detect_coverage(
     return out
 
 
-def analysis_start_date(coverage: List[Dict[str, Any]], anchors: Iterable[str]) -> Optional[date]:
+def analysis_start_date(coverage: list[dict[str, Any]], anchors: Iterable[str]) -> date | None:
     """The date from which the continuously-tracked core metrics are all live."""
     starts = [
         date.fromisoformat(c['reliable_start'])
@@ -1103,11 +1111,11 @@ def hr_zone_for_bpm(bpm: float, max_hr: float) -> str:
     return 'z5'
 
 
-def heart_rate_samples(data: ExportData) -> List[HealthRecord]:
+def heart_rate_samples(data: ExportData) -> list[HealthRecord]:
     return [r for r in data.records if r.type == 'HKQuantityTypeIdentifierHeartRate' and r.value is not None]
 
 
-def cycling_metric_samples(data: ExportData, metric_type: str) -> List[HealthRecord]:
+def cycling_metric_samples(data: ExportData, metric_type: str) -> list[HealthRecord]:
     return [r for r in data.records if r.type == metric_type and r.value is not None]
 
 
@@ -1117,9 +1125,9 @@ MAX_HR_OUTLIER_GAP = 10.0
 
 
 def observed_max_hr(
-    hr_samples: List[HealthRecord],
-    workouts: Optional[List[Workout]] = None,
-) -> Tuple[Optional[float], Optional[float], str]:
+    hr_samples: list[HealthRecord],
+    workouts: list[Workout] | None = None,
+) -> tuple[float | None, float | None, str]:
     """Best estimate of true max HR, plus the raw absolute peak and a note.
 
     Workouts carry their own `WorkoutStatistics maximum`, often higher than any
@@ -1148,7 +1156,7 @@ def observed_max_hr(
         return absolute, absolute, ''
 
     top = workout_maxima[0]
-    corroboration = [v for v in ([sample_max] if sample_max is not None else []) + workout_maxima[1:]]
+    corroboration = ([sample_max] if sample_max is not None else []) + workout_maxima[1:]
     runner_up = max(corroboration, default=None)
     if runner_up is not None and top - runner_up > MAX_HR_OUTLIER_GAP:
         note = (f'ignored an isolated workout peak of {top:.0f} bpm — no other sample or '
@@ -1159,11 +1167,11 @@ def observed_max_hr(
 
 
 def resolve_max_hr(
-    hr_samples: List[HealthRecord],
-    configured: Optional[float] = None,
-    age: Optional[int] = None,
-    workouts: Optional[List[Workout]] = None,
-) -> Tuple[float, str]:
+    hr_samples: list[HealthRecord],
+    configured: float | None = None,
+    age: int | None = None,
+    workouts: list[Workout] | None = None,
+) -> tuple[float, str]:
     """Pick a max HR for zone maths, preferring evidence over a fixed default."""
     if configured:
         return float(configured), 'configured via --max-hr'
@@ -1197,14 +1205,14 @@ def overlap_minutes(a_start: datetime, a_end: datetime, b_start: datetime, b_end
 
 def compute_workout_hr_zones(
     workout: Workout,
-    hr_samples: List[HealthRecord],
+    hr_samples: list[HealthRecord],
     max_hr: float = DEFAULT_MAX_HR,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     in_window = [s for s in hr_samples if s.start < workout.end and s.end > workout.start]
     in_window.sort(key=lambda s: s.start)
 
     zone_mins = {f'hr_zone_{z}_min': 0.0 for _, z in HR_ZONE_BOUNDS}
-    bpm_values: List[float] = []
+    bpm_values: list[float] = []
 
     for i, sample in enumerate(in_window):
         bpm = sample.value
@@ -1224,7 +1232,7 @@ def compute_workout_hr_zones(
         zone = hr_zone_for_bpm(bpm, max_hr)
         zone_mins[f'hr_zone_{zone}_min'] += minutes
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         'avg_heart_rate_bpm': round(statistics.mean(bpm_values), 1) if bpm_values else '',
         'max_heart_rate_bpm': round(max(bpm_values), 1) if bpm_values else '',
     }
@@ -1233,24 +1241,24 @@ def compute_workout_hr_zones(
     return result
 
 
-def stat_value(workout: Workout, stat_type: str, field_name: str = 'average') -> Optional[float]:
+def stat_value(workout: Workout, stat_type: str, field_name: str = 'average') -> float | None:
     stat = workout.statistics.get(stat_type, {})
     return stat.get(field_name)
 
 
-def metrics_in_workout_window(workout: Workout, samples: List[HealthRecord]) -> List[float]:
+def metrics_in_workout_window(workout: Workout, samples: list[HealthRecord]) -> list[float]:
     return [
         s.value for s in samples
         if s.start < workout.end and s.end > workout.start and s.value is not None
     ]
 
 
-def build_workout_summary(data: ExportData, max_hr: float = DEFAULT_MAX_HR) -> List[Dict[str, Any]]:
+def build_workout_summary(data: ExportData, max_hr: float = DEFAULT_MAX_HR) -> list[dict[str, Any]]:
     hr_samples = heart_rate_samples(data)
     power_samples = cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingPower')
     cadence_samples = cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingCadence')
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for workout in sorted(data.workouts, key=lambda w: w.start):
         duration_min = duration_to_minutes(workout.duration, workout.duration_unit)
         if duration_min is None:
@@ -1354,11 +1362,11 @@ WEEKLY_SUM_COLUMNS = [
 
 
 def build_weekly_summary(
-    daily_rows: List[Dict[str, Any]],
-    workouts: List[Workout],
-    workout_rows: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    weeks: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+    daily_rows: list[dict[str, Any]],
+    workouts: list[Workout],
+    workout_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    weeks: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 
     for row in daily_rows:
         if not row.get('date'):
@@ -1368,21 +1376,19 @@ def build_weekly_summary(
         for src, _dest in WEEKLY_MEAN_COLUMNS + WEEKLY_SUM_COLUMNS:
             val = row.get(src)
             if val not in ('', None):
-                try:
+                with contextlib.suppress(TypeError, ValueError):
                     bucket[src].append(float(val))
-                except (TypeError, ValueError):
-                    pass
         if row.get('wear_class') == 'full':
             bucket['_full_wear_days'].append(1.0)
 
-    workout_weeks: Dict[str, List[Workout]] = defaultdict(list)
+    workout_weeks: dict[str, list[Workout]] = defaultdict(list)
     for w in workouts:
         workout_weeks[iso_week_key(local_calendar_date(w.start))].append(w)
 
     workout_row_by_id = {r['workout_id']: r for r in workout_rows}
     all_weeks = sorted(set(weeks.keys()) | set(workout_weeks.keys()))
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for wk in all_weeks:
         wlist = workout_weeks.get(wk, [])
         b = weeks.get(wk, {})
@@ -1394,7 +1400,7 @@ def build_weekly_summary(
             if z2 not in ('', None):
                 z2_total += float(z2)
 
-        row: Dict[str, Any] = {
+        row: dict[str, Any] = {
             'iso_week': wk,
             'full_wear_days': int(sum(b.get('_full_wear_days', []))) or '',
             'workouts_total': len(wlist) if wlist else '',
@@ -1414,7 +1420,7 @@ def build_weekly_summary(
     return rows
 
 
-def weekly_column_order() -> List[str]:
+def weekly_column_order() -> list[str]:
     cols = ['iso_week', 'full_wear_days', 'workouts_total', 'strength_sessions',
             'cycling_sessions', 'walking_sessions', 'zone2_minutes_estimate']
     cols += [dest for _src, dest in WEEKLY_SUM_COLUMNS]
@@ -1426,7 +1432,7 @@ def weekly_column_order() -> List[str]:
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def write_csv(path: str, fieldnames: List[str], rows: Iterable[Dict[str, Any]]) -> None:
+def write_csv(path: str, fieldnames: list[str], rows: Iterable[dict[str, Any]]) -> None:
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
@@ -1443,14 +1449,14 @@ def write_available_types(path: str, type_counts: Counter) -> None:
             writer.writerow([t, count, 'yes' if used else 'no'])
 
 
-def empty_ratio(rows: List[Dict[str, Any]], column: str) -> float:
+def empty_ratio(rows: list[dict[str, Any]], column: str) -> float:
     if not rows:
         return 1.0
     empty = sum(1 for r in rows if r.get(column) in ('', None))
     return empty / len(rows)
 
 
-def detect_duplicate_bursts(records: List[HealthRecord], threshold: int = 50) -> List[str]:
+def detect_duplicate_bursts(records: list[HealthRecord], threshold: int = 50) -> list[str]:
     by_minute: Counter = Counter()
     for rec in records:
         by_minute[(rec.type, rec.start.replace(second=0, microsecond=0))] += 1
@@ -1461,7 +1467,7 @@ def detect_duplicate_bursts(records: List[HealthRecord], threshold: int = 50) ->
     return lines
 
 
-def summarize_wear(daily_rows: List[Dict[str, Any]], since: Optional[date]) -> Dict[str, int]:
+def summarize_wear(daily_rows: list[dict[str, Any]], since: date | None) -> dict[str, int]:
     counts = Counter()
     for row in daily_rows:
         d = date.fromisoformat(row['date'])
@@ -1473,12 +1479,12 @@ def summarize_wear(daily_rows: List[Dict[str, Any]], since: Optional[date]) -> D
 
 def write_data_quality_report(
     path: str,
-    daily_rows: List[Dict[str, Any]],
-    workout_rows: List[Dict[str, Any]],
-    weekly_rows: List[Dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
+    workout_rows: list[dict[str, Any]],
+    weekly_rows: list[dict[str, Any]],
     data: ExportData,
-    coverage: List[Dict[str, Any]],
-    analysis_start: Optional[date],
+    coverage: list[dict[str, Any]],
+    analysis_start: date | None,
     max_hr: float,
     max_hr_note: str,
     tz_label: str,
@@ -1567,9 +1573,9 @@ def write_data_quality_report(
         f.write('\n'.join(lines) + '\n')
 
 
-def records_to_legacy_rows(data: ExportData) -> List[Dict[str, str]]:
+def records_to_legacy_rows(data: ExportData) -> list[dict[str, str]]:
     """Backward-compatible flat rows for full_health_data.csv."""
-    rows: List[Dict[str, str]] = []
+    rows: list[dict[str, str]] = []
 
     for rec in data.records:
         if rec.type not in TARGET_TYPES:
@@ -1607,18 +1613,18 @@ ANALYSIS_ANCHORS = ('resting_hr', 'hrv_sdnn', 'sleep_asleep_hours')
 
 @dataclass
 class CoachingResult:
-    paths: Dict[str, str]
-    daily_rows: List[Dict[str, Any]]
-    coverage: List[Dict[str, Any]]
-    analysis_start: Optional[date]
+    paths: dict[str, str]
+    daily_rows: list[dict[str, Any]]
+    coverage: list[dict[str, Any]]
+    analysis_start: date | None
     max_hr: float
 
 
 def write_coaching_outputs(
     base_dir: str,
     data: ExportData,
-    max_hr_override: Optional[float] = None,
-    age: Optional[int] = None,
+    max_hr_override: float | None = None,
+    age: int | None = None,
 ) -> CoachingResult:
     data.timezone_label = infer_timezone_label(data.records, data.workouts)
 

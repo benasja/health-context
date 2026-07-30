@@ -70,6 +70,7 @@ from health_insights import (
     render_llm_context,
     rolling_baseline,
 )
+import health_mcp
 from health_mcp import (
     DEFAULT_PROTOCOL,
     HANDLERS,
@@ -1436,6 +1437,74 @@ class TestMcpDataLayer(unittest.TestCase):
         self.assertTrue(os.path.isabs(server['command']))
         self.assertIn('--data-dir', server['args'])
         self.assertTrue(all(os.path.isabs(a) for a in server['args'] if a != '--data-dir'))
+
+
+class TestMcpOutputLimits(unittest.TestCase):
+    """A local model with an 8K window is the constraint here: one uncapped
+    tool result can consume the whole context before it answers anything."""
+
+    def setUp(self):
+        self._original = health_mcp.MAX_OUTPUT_CHARS
+
+    def tearDown(self):
+        health_mcp.MAX_OUTPUT_CHARS = self._original
+
+    def test_short_text_is_untouched(self):
+        health_mcp.MAX_OUTPUT_CHARS = 1000
+        self.assertEqual(health_mcp.truncate('short'), 'short')
+
+    def test_long_text_is_cut_and_announced(self):
+        health_mcp.MAX_OUTPUT_CHARS = 200
+        out = health_mcp.truncate('x' * 5000)
+        self.assertLess(len(out), 1000)
+        self.assertIn('truncated', out)
+
+    def test_truncation_warns_the_model_not_to_trust_the_last_row(self):
+        # Silently dropping rows is the dangerous case: a truncated table is
+        # indistinguishable from a complete one.
+        health_mcp.MAX_OUTPUT_CHARS = 200
+        out = health_mcp.truncate('row\n' * 500)
+        self.assertIn('INCOMPLETE', out)
+
+    def test_cut_lands_on_a_line_boundary(self):
+        health_mcp.MAX_OUTPUT_CHARS = 300
+        out = health_mcp.truncate('\n'.join(f'line {i}' for i in range(200)))
+        body = out.split('_[truncated')[0]
+        self.assertFalse(body.rstrip('\n').endswith('lin'))
+
+
+class TestMcpSections(unittest.TestCase):
+    DOC = """# Pack
+
+preamble text
+
+## Situation
+
+body one
+
+## Capacity gap
+
+body two
+
+## Limits
+
+body three
+"""
+
+    def test_sections_are_split_on_top_level_headings(self):
+        sections = health_mcp.markdown_sections(self.DOC)
+        self.assertEqual(list(sections), ['Situation', 'Capacity gap', 'Limits'])
+
+    def test_section_body_includes_its_heading(self):
+        sections = health_mcp.markdown_sections(self.DOC)
+        self.assertTrue(sections['Situation'].startswith('## Situation'))
+        self.assertIn('body one', sections['Situation'])
+
+    def test_preamble_before_the_first_heading_is_not_a_section(self):
+        self.assertNotIn('preamble text', ''.join(health_mcp.markdown_sections(self.DOC).values()))
+
+    def test_empty_document_yields_nothing(self):
+        self.assertEqual(health_mcp.markdown_sections(''), {})
 
 
 if __name__ == '__main__':

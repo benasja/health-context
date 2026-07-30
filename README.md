@@ -265,6 +265,40 @@ The server reads the generated CSVs, never `export.xml` — parsing a gigabyte o
 XML takes ~40 seconds, which no client will wait for on every call. It reports
 how old the data is, so the model knows when it is answering from a stale export.
 
+### Other clients, and local models
+
+MCP is an open protocol, so this is not Claude-specific — anything that speaks
+MCP over stdio works. That includes editor assistants (Cursor, Zed, Continue,
+Cline, VS Code) and clients that can drive a **local** model, which is the
+interesting case for health data: nothing ever leaves the machine, not even to
+an API.
+
+The reason a modest local model can do useful work here is that it never has to
+crunch anything. The 2.1M records, the baselines, the percentiles and the
+capacity comparisons are all computed in Python beforehand; the model reads a
+small table and reasons about it. That is a very different task from handing a
+7B model a year of CSV and hoping.
+
+Two things matter when running locally:
+
+**Context window.** A single uncapped tool result can swallow an 8K window
+before the model answers anything. Cap it:
+
+```bash
+python3 health_mcp.py --data-dir output --max-output-chars 6000
+```
+
+`health_context_pack` also takes a `section` argument — called bare it returns a
+~300-token index of the 15 sections, so the model fetches only what it needs
+instead of a 6,500-token wall. Any result that does get cut says so explicitly,
+including a warning not to treat the last visible row as the last that exists.
+
+**Tool-calling quality.** The server assumes a model that reads tool
+descriptions and picks sensibly. Very small models tend to guess metric names
+instead of calling `health_list_metrics` first, then report "no data" for a
+metric that exists under another name. Anything competent at function calling
+handles this; the smallest models will need the metric name given to them.
+
 ## Development
 
 ```bash

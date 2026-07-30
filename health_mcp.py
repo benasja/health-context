@@ -40,6 +40,12 @@ DEFAULT_PROTOCOL = SUPPORTED_PROTOCOLS[0]
 MAX_ROWS = 400          # hard cap on rows returned by any one call
 STALE_AFTER_DAYS = 14   # when to start telling the model the export is old
 
+# Ceiling on a single tool result, in characters. Generous by default; a local
+# model with an 8K window needs roughly 6000 here or one call consumes the whole
+# context before it can answer. Overridden by --max-output-chars.
+DEFAULT_MAX_OUTPUT_CHARS = 20000
+MAX_OUTPUT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
+
 
 def log(message: str) -> None:
     """Diagnostics must go to stderr; stdout carries the protocol."""
@@ -196,6 +202,43 @@ def parse_date(raw: str | None, fallback: date | None = None) -> date | None:
         raise ValueError(f'"{raw}" is not a date. Use YYYY-MM-DD.') from exc
 
 
+def truncate(text: str, hint: str = '') -> str:
+    """Cut an over-long result at a line boundary and say so.
+
+    Silently dropping the tail is worse than useless: the model cannot tell a
+    truncated table from a complete one, and will happily conclude that the
+    last row it can see is the last row that exists.
+    """
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    clipped = text[:MAX_OUTPUT_CHARS]
+    cut = clipped.rfind('\n')
+    if cut > MAX_OUTPUT_CHARS // 2:
+        clipped = clipped[:cut]
+    dropped = len(text) - len(clipped)
+    note = (f'\n\n_[truncated: {dropped:,} more characters. This output was cut to fit a '
+            f'{MAX_OUTPUT_CHARS:,}-character limit, so it is INCOMPLETE — do not treat the '
+            'last row as the last that exists.')
+    note += f' {hint}]_' if hint else ']_'
+    return clipped + note
+
+
+def markdown_sections(doc: str) -> dict[str, str]:
+    """Split a generated report into its top-level `## ` sections."""
+    sections: dict[str, str] = {}
+    current, body = None, []
+    for line in doc.splitlines():
+        if line.startswith('## '):
+            if current:
+                sections[current] = '\n'.join(body).strip()
+            current, body = line[3:].strip(), [line]
+        elif current:
+            body.append(line)
+    if current:
+        sections[current] = '\n'.join(body).strip()
+    return sections
+
+
 def describe(values: list[float]) -> str:
     if not values:
         return '_no measured days in range_'
@@ -250,7 +293,8 @@ def _overview(data: HealthData, _args: dict[str, Any]) -> str:
         # the two disagreeing.
         cut = context.find('## Distribution')
         head = context[:cut] if cut > 0 else context
-        return head.strip() + '\n\n' + _freshness_note(data)
+        return truncate(head.strip() + '\n\n' + _freshness_note(data),
+                        'Use health_context_pack for specific sections.')
     return _fallback_overview(data)
 
 
@@ -578,15 +622,38 @@ def _weekly(data: HealthData, args: dict[str, Any]) -> str:
 
 @tool(
     'health_context_pack',
-    'The complete pre-computed briefing: capacity gap, inferred events, personal '
-    'records, load eras, distributions, streaks, correlations and the explicit limits '
-    'of what this data can support. Large — prefer the targeted tools unless a full '
-    'picture is genuinely needed.',
-    obj({}),
+    'The pre-computed briefing: capacity gap, inferred events, personal records, load '
+    'eras, distributions, streaks, correlations, and the explicit limits of this data. '
+    'Call with no arguments to list the sections, then request one by name — the whole '
+    'pack is large and will crowd out a small context window.',
+    obj({'section': {'type': 'string',
+                     'description': 'Section name, or a substring of one. Omit to list '
+                                    'the available sections with their sizes.'}}),
 )
-def _context_pack(data: HealthData, _args: dict[str, Any]) -> str:
+def _context_pack(data: HealthData, args: dict[str, Any]) -> str:
     doc = data.doc('context')
-    return doc if doc else data.missing_data_message()
+    if not doc:
+        return data.missing_data_message()
+
+    sections = markdown_sections(doc)
+    wanted = (args.get('section') or '').strip().lower()
+
+    if not wanted:
+        rows = [[name, f'{len(body):,}'] for name, body in sections.items()]
+        preamble = doc[:doc.find('## ')].strip() if '## ' in doc else ''
+        return (preamble + '\n\n' if preamble else '') + \
+            f'**{len(sections)} sections available.** Request one by name.\n\n' + \
+            table(['section', 'characters'], rows) + \
+            '\n\n_Pass `section` to fetch one. Ask for "all" to get the whole pack._'
+
+    if wanted == 'all':
+        return truncate(doc, 'Request individual sections instead.')
+
+    for name, body in sections.items():
+        if wanted == name.lower() or wanted in name.lower():
+            return truncate(body)
+    return (f'No section matching "{args.get("section")}". Available: '
+            + ', '.join(sections) + '.')
 
 
 @tool(
@@ -674,7 +741,10 @@ def handle(message: dict[str, Any], data: HealthData) -> dict[str, Any] | None:
                 'content': [{'type': 'text', 'text': f'{name} failed: {exc}'}],
                 'isError': True,
             })
-        return make_result(request_id, {'content': [{'type': 'text', 'text': text}]})
+        # Capped here rather than in each tool: a new tool would otherwise be one
+        # oversight away from flooding a small context window.
+        return make_result(request_id, {'content': [{'type': 'text',
+                                                     'text': truncate(text)}]})
 
     return make_error(request_id, -32601, f'Method not found: {method}')
 
@@ -725,11 +795,18 @@ def main() -> None:
     )
     parser.add_argument('--data-dir', default='output',
                         help='Directory holding the generated CSVs (default: output)')
+    parser.add_argument('--max-output-chars', type=int, default=DEFAULT_MAX_OUTPUT_CHARS,
+                        help='Ceiling on a single tool result (default '
+                             f'{DEFAULT_MAX_OUTPUT_CHARS}). Set ~6000 for a local model '
+                             'with an 8K context window.')
     parser.add_argument('--print-config', action='store_true',
                         help='Print the JSON block to add to your MCP client config, then exit')
     parser.add_argument('--check', action='store_true',
                         help='Verify the data loads and list the tools, then exit')
     args = parser.parse_args()
+
+    global MAX_OUTPUT_CHARS
+    MAX_OUTPUT_CHARS = max(1000, args.max_output_chars)
 
     data = HealthData(args.data_dir)
 
@@ -744,7 +821,8 @@ def main() -> None:
         last, age = data.freshness()
         print(f'OK  {len(data.dates())} days in {data.dir}, ending {last} ({age} days ago)')
         print(f'    {len(data.metrics())} metrics, {len(data.table("workouts"))} workouts')
-        print(f'    {len(TOOLS)} tools: ' + ', '.join(t['name'] for t in TOOLS))
+        print(f'    {len(TOOLS)} tools, output capped at {MAX_OUTPUT_CHARS:,} chars')
+        print('    ' + ', '.join(t['name'] for t in TOOLS))
         return
 
     serve(data)

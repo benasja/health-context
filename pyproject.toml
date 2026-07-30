@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "health-context"
+version = "2.1.0"
+description = "Turn an Apple Health export into a context pack an LLM can reason about"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["apple-health", "healthkit", "mcp", "quantified-self", "llm"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+# Deliberately empty, and worth keeping that way. The whole point is that
+# someone can look at their own health data without first being asked to build
+# a Python environment.
+dependencies = []
+
+[project.scripts]
+health-convert = "convert_health_data:main"
+health-mcp = "health_mcp:main"
+
+[project.urls]
+Homepage = "https://github.com/benasja/xml_csv_converter_applehealth"
+Issues = "https://github.com/benasja/xml_csv_converter_applehealth/issues"
+
+[tool.setuptools]
+# Flat single-file modules rather than a package directory: the layout predates
+# packaging and renaming files would break every path in the README for no gain.
+py-modules = [
+    "convert_health_data",
+    "health_coaching",
+    "health_history",
+    "health_ingest",
+    "health_insights",
+    "health_mcp",
+    "health_metrics",
+]

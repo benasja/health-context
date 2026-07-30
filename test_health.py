@@ -11,7 +11,9 @@ plausible-looking wrong numbers rather than an error. Stdlib only:
 import csv
 import json
 import os
+import plistlib
 import tempfile
+import zipfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 
@@ -70,6 +72,7 @@ from health_insights import (
     render_llm_context,
     rolling_baseline,
 )
+import health_ingest
 import health_mcp
 from health_mcp import (
     DEFAULT_PROTOCOL,
@@ -1505,6 +1508,154 @@ body three
 
     def test_empty_document_yields_nothing(self):
         self.assertEqual(health_mcp.markdown_sections(''), {})
+
+
+class TestExportIngest(unittest.TestCase):
+    """Whatever the user points at should work: the zip from their phone, the
+    unzipped folder, or the folder they dropped it in."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.out = tempfile.mkdtemp()
+
+    def _make_zip(self, path, members=None):
+        members = members or {'apple_health_export/export.xml': '<HealthData/>'}
+        with zipfile.ZipFile(path, 'w') as z:
+            for name, body in members.items():
+                z.writestr(name, body)
+        return path
+
+    def test_plain_folder_with_export_is_used_directly(self):
+        open(os.path.join(self.tmp, 'export.xml'), 'w').close()
+        found = health_ingest.resolve(self.tmp, self.out)
+        self.assertEqual(found.directory, self.tmp)
+        self.assertFalse(found.extracted)
+
+    def test_parent_of_apple_health_export_descends(self):
+        nested = os.path.join(self.tmp, 'apple_health_export')
+        os.makedirs(nested)
+        open(os.path.join(nested, 'export.xml'), 'w').close()
+        found = health_ingest.resolve(self.tmp, self.out)
+        self.assertEqual(found.directory, nested)
+
+    def test_zip_is_extracted(self):
+        z = self._make_zip(os.path.join(self.tmp, 'export.zip'))
+        found = health_ingest.resolve(z, self.out)
+        self.assertTrue(found.extracted)
+        self.assertTrue(os.path.exists(os.path.join(found.directory, 'export.xml')))
+
+    def test_folder_containing_a_zip_picks_it_up(self):
+        self._make_zip(os.path.join(self.tmp, 'export.zip'))
+        found = health_ingest.resolve(self.tmp, self.out)
+        self.assertTrue(found.extracted)
+
+    def test_newest_zip_wins(self):
+        old = self._make_zip(os.path.join(self.tmp, 'old.zip'),
+                             {'apple_health_export/export.xml': 'OLD'})
+        new = self._make_zip(os.path.join(self.tmp, 'new.zip'),
+                             {'apple_health_export/export.xml': 'NEW'})
+        os.utime(old, (1_600_000_000, 1_600_000_000))
+        os.utime(new, (1_700_000_000, 1_700_000_000))
+        found = health_ingest.resolve(self.tmp, self.out)
+        with open(os.path.join(found.directory, 'export.xml')) as f:
+            self.assertEqual(f.read(), 'NEW')
+
+    def test_extraction_is_cached_between_runs(self):
+        z = self._make_zip(os.path.join(self.tmp, 'export.zip'))
+        first = health_ingest.resolve(z, self.out).directory
+        marker = os.path.join(first, 'export.xml')
+        stamp = os.path.getmtime(marker)
+        health_ingest.resolve(z, self.out)
+        self.assertEqual(os.path.getmtime(marker), stamp)
+
+    def test_a_newer_zip_invalidates_the_cache(self):
+        z = os.path.join(self.tmp, 'export.zip')
+        self._make_zip(z, {'apple_health_export/export.xml': 'FIRST'})
+        health_ingest.resolve(z, self.out)
+        self._make_zip(z, {'apple_health_export/export.xml': 'SECOND'})
+        os.utime(z, None)
+        found = health_ingest.resolve(z, self.out)
+        with open(os.path.join(found.directory, 'export.xml')) as f:
+            self.assertEqual(f.read(), 'SECOND')
+
+    def test_zip_slip_members_are_refused(self):
+        # A zip can name ../ or absolute paths; extracting those writes outside
+        # the destination. The archive is the user's own, but a tool other
+        # people run should not assume that.
+        z = self._make_zip(os.path.join(self.tmp, 'export.zip'), {
+            'apple_health_export/export.xml': 'ok',
+            'apple_health_export/../../escaped.txt': 'nope',
+        })
+        found = health_ingest.resolve(z, self.out)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.out), 'escaped.txt')))
+        self.assertTrue(os.path.exists(os.path.join(found.directory, 'export.xml')))
+
+    def test_only_needed_members_are_extracted(self):
+        # A full export is ~1.4 GB unpacked; route GPX and the CDA mirror are
+        # never read, so unpacking them is pure cost.
+        z = self._make_zip(os.path.join(self.tmp, 'export.zip'), {
+            'apple_health_export/export.xml': 'ok',
+            'apple_health_export/export_cda.xml': 'big',
+            'apple_health_export/workout-routes/route.gpx': 'big',
+            'apple_health_export/electrocardiograms/ecg_1.csv': 'small',
+        })
+        found = health_ingest.resolve(z, self.out)
+        self.assertTrue(os.path.exists(os.path.join(found.directory, 'export.xml')))
+        self.assertTrue(os.path.exists(os.path.join(found.directory, 'electrocardiograms', 'ecg_1.csv')))
+        self.assertFalse(os.path.exists(os.path.join(found.directory, 'export_cda.xml')))
+        self.assertFalse(os.path.exists(os.path.join(found.directory, 'workout-routes')))
+
+    def test_zip_without_an_export_is_rejected_clearly(self):
+        z = self._make_zip(os.path.join(self.tmp, 'export.zip'), {'notes.txt': 'hi'})
+        with self.assertRaises(ValueError) as ctx:
+            health_ingest.resolve(z, self.out)
+        self.assertIn('Apple Health export', str(ctx.exception))
+
+    def test_empty_folder_explains_what_to_do(self):
+        with self.assertRaises(ValueError) as ctx:
+            health_ingest.resolve(self.tmp, self.out)
+        self.assertIn('Export All Health Data', str(ctx.exception))
+
+    def test_missing_path_is_reported(self):
+        with self.assertRaises(ValueError):
+            health_ingest.resolve(os.path.join(self.tmp, 'nope'), self.out)
+
+
+class TestScheduleGeneration(unittest.TestCase):
+    """The scheduled job is pasted straight into launchd/systemd/schtasks, so a
+    malformed one fails at install time with an opaque error."""
+
+    ARGS = {'python': '/usr/bin/python3', 'script': '/opt/app/convert_health_data.py',
+            'watch': '/Users/me/Downloads', 'out': '/Users/me/health'}
+
+    def test_macos_emits_a_parseable_plist(self):
+        text = health_ingest.schedule_instructions(**self.ARGS, platform_name='darwin')
+        parsed = plistlib.loads(text[text.index('<?xml'):].encode())
+        self.assertEqual(parsed['Label'], 'com.health-context.rebuild')
+        self.assertEqual(parsed['StartCalendarInterval'], {'Day': 1, 'Hour': 9})
+
+    def test_macos_plist_carries_the_real_paths(self):
+        text = health_ingest.schedule_instructions(**self.ARGS, platform_name='darwin')
+        argv = plistlib.loads(text[text.index('<?xml'):].encode())['ProgramArguments']
+        self.assertEqual(argv[0], self.ARGS['python'])
+        self.assertIn(self.ARGS['watch'], argv)
+        self.assertIn(self.ARGS['out'], argv)
+
+    def test_linux_emits_both_unit_files(self):
+        text = health_ingest.schedule_instructions(**self.ARGS, platform_name='linux')
+        self.assertIn('[Service]', text)
+        self.assertIn('[Timer]', text)
+        self.assertIn('OnCalendar=monthly', text)
+        self.assertIn(self.ARGS['script'], text)
+
+    def test_windows_emits_a_schtasks_command(self):
+        text = health_ingest.schedule_instructions(**self.ARGS, platform_name='win32')
+        self.assertIn('schtasks /Create', text)
+        self.assertIn('/SC MONTHLY', text)
+
+    def test_unknown_platform_falls_back_to_systemd(self):
+        text = health_ingest.schedule_instructions(**self.ARGS, platform_name='freebsd99')
+        self.assertIn('[Timer]', text)
 
 
 if __name__ == '__main__':

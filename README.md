@@ -8,16 +8,36 @@ Python 3.10+. **No dependencies** — standard library only.
 
 ## Quick start
 
-1. Health app → profile picture → **Export All Health Data**.
-2. Unzip and put `export.xml` next to `convert_health_data.py` (optionally
-   `export_cda.xml` and `electrocardiograms/` too).
-3. Run:
+1. Health app → profile picture → **Export All Health Data**. AirDrop or copy
+   the zip to your computer.
+2. Point the tool at it. **No unzipping** — hand it the zip exactly as it arrived:
 
 ```bash
-python3 convert_health_data.py
+python3 convert_health_data.py --data-dir ~/Downloads/export.zip --out-dir output
 ```
 
-A ~1 GB export takes about a minute and shows a progress bar while parsing.
+`--data-dir` accepts the `.zip`, an unzipped `apple_health_export/` folder, or
+any folder containing either — point it at `~/Downloads` and it picks the newest
+export it finds. Only the files actually parsed are extracted (~1 GB of the
+~1.4 GB export is route GPX and a clinical-document mirror that is never read),
+and the extraction is cached until you export again.
+
+A full run is around two minutes, with a progress bar during the parse.
+
+### Installing
+
+Nothing to install — clone and run, on macOS, Linux or Windows. Python 3.10+,
+zero dependencies.
+
+If you would rather have the commands on your `PATH`:
+
+```bash
+pip install git+https://github.com/benasja/xml_csv_converter_applehealth
+health-convert --data-dir ~/Downloads/export.zip --out-dir ~/health
+```
+
+That gives you `health-convert` and `health-mcp`. Still no runtime dependencies —
+packaging only adds the entry points.
 
 ### Options
 
@@ -298,6 +318,32 @@ descriptions and picks sensibly. Very small models tend to guess metric names
 instead of calling `health_list_metrics` first, then report "no data" for a
 metric that exists under another name. Anything competent at function calling
 handles this; the smallest models will need the metric name given to them.
+
+## Keeping it up to date automatically
+
+**Apple provides no way to trigger an export programmatically** — no API, no
+Shortcuts action, no iCloud sync of the export file. "Export All Health Data" is
+a manual tap, and nothing here can change that. (Third-party HealthKit apps that
+hold Apple's entitlements can write exports on a schedule; that is the only
+automated source.)
+
+Everything *after* the export can be automated, and the manual part reduces to:
+export, AirDrop to your Downloads folder, done.
+
+Point the scheduler at the folder your exports land in:
+
+```bash
+python3 convert_health_data.py --data-dir ~/Downloads --out-dir ~/health --print-schedule
+```
+
+That prints a ready-to-install monthly job for your OS — a launchd plist on
+macOS, a systemd service and timer on Linux, a `schtasks` command on Windows —
+with real paths already filled in. Save or run it as the comment says.
+
+From then on it rebuilds monthly from the newest export in that folder. The MCP
+server re-reads on every call, so it needs no restart, and if you forget to
+export it tells the model the data is stale rather than quietly answering from
+old numbers.
 
 ## Development
 

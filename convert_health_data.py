@@ -6,7 +6,9 @@ import argparse
 import csv
 import glob
 import os
+import sys
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 
 from health_coaching import (
@@ -20,6 +22,7 @@ from health_coaching import (
     records_to_legacy_rows,
     write_coaching_outputs,
 )
+import health_ingest
 from health_insights import write_insight_outputs
 
 
@@ -154,7 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
         description='Convert an Apple Health export into CSVs and an insights report.',
     )
     p.add_argument('--data-dir', default=None,
-                   help='Directory holding export.xml (default: alongside this script)')
+                   help='Your Apple Health export. Accepts the .zip straight from your '
+                        'phone, the unzipped apple_health_export folder, or a folder '
+                        'containing either (the newest .zip wins). Default: next to this script.')
     p.add_argument('--out-dir', default=None,
                    help='Where to write outputs (default: same as --data-dir)')
     p.add_argument('--max-hr', type=float, default=None,
@@ -163,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Age, used to sanity-check max HR when no higher value was recorded.')
     p.add_argument('--skip-legacy', action='store_true',
                    help='Skip the large flat full_health_data.csv (much faster).')
+    p.add_argument('--print-schedule', action='store_true',
+                   help='Print a ready-to-install monthly scheduled job for this OS '
+                        '(launchd / systemd / Task Scheduler), then exit.')
+    p.add_argument('--force-extract', action='store_true',
+                   help='Re-extract from the zip even if a current extraction is cached.')
     p.add_argument('--include-cda', action='store_true',
                    help='Also parse export_cda.xml. Off by default: it is a clinical-document '
                         'mirror of export.xml whose records cannot be matched against the main '
@@ -174,19 +184,41 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    base_dir = os.path.abspath(args.data_dir or os.path.dirname(os.path.abspath(__file__)))
-    out_dir = os.path.abspath(args.out_dir or base_dir)
+    requested = args.data_dir or os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.abspath(args.out_dir or requested)
+
+    if args.print_schedule:
+        print(health_ingest.schedule_instructions(
+            python=sys.executable,
+            script=os.path.abspath(__file__),
+            watch=os.path.abspath(os.path.expanduser(requested)),
+            out=out_dir,
+            platform_name=sys.platform))
+        return
+
+    if os.path.isfile(out_dir):
+        out_dir = os.path.dirname(out_dir)
     os.makedirs(out_dir, exist_ok=True)
+
+    print('=' * 60)
+    print('Apple Health Data Converter')
+    print('=' * 60)
+
+    try:
+        found = health_ingest.resolve(requested, out_dir, force=args.force_extract)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        print(f'Error: {exc}')
+        raise SystemExit(1) from exc
+
+    base_dir = found.directory
+    if found.note:
+        print(f'Export: {found.note}')
 
     export_xml = os.path.join(base_dir, 'export.xml')
     export_cda_xml = os.path.join(base_dir, 'export_cda.xml')
     ecg_dir = os.path.join(base_dir, 'electrocardiograms')
 
     data = ExportData()
-
-    print('=' * 60)
-    print('Apple Health Data Converter')
-    print('=' * 60)
 
     if os.path.exists(export_xml):
         iter_export_xml(export_xml, data)

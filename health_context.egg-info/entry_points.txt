@@ -1,0 +1,3 @@
+[console_scripts]
+health-convert = convert_health_data:main
+health-mcp = health_mcp:main

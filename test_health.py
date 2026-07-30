@@ -29,6 +29,19 @@ from health_coaching import (
     resolve_max_hr,
     source_priority,
 )
+from health_history import (
+    METRICS_BY_COLUMN,
+    StreakRule,
+    build_history,
+    build_metric_series,
+    compute_capacity,
+    compute_records,
+    compute_streak,
+    group_strain_episodes,
+    percentile,
+    segment_eras,
+    signal_kind,
+)
 from health_insights import (
     build_series,
     carry_forward,
@@ -36,6 +49,7 @@ from health_insights import (
     compute_trends,
     illness_signals,
     pearson,
+    render_llm_context,
     rolling_baseline,
 )
 from health_metrics import (
@@ -563,6 +577,325 @@ class TestStatistics(unittest.TestCase):
     def test_blank_is_not_read_as_zero(self):
         rows = [{'date': '2026-01-01', 'steps': ''}]
         self.assertEqual(build_series(rows, 'steps'), {})
+
+
+HISTORY_START = date(2025, 1, 1)
+
+
+def hist_rows(**columns):
+    """Daily rows from parallel column lists. `None` writes a blank cell."""
+    length = max(len(v) for v in columns.values())
+    rows = []
+    for i in range(length):
+        row = {'date': (HISTORY_START + timedelta(days=i)).isoformat()}
+        for col, values in columns.items():
+            value = values[i] if i < len(values) else None
+            row[col] = '' if value is None else value
+        rows.append(row)
+    return rows
+
+
+def day_list(n, start=HISTORY_START):
+    return [start + timedelta(days=k) for k in range(n)]
+
+
+class TestHistorySeries(unittest.TestCase):
+    def test_blank_day_is_zero_for_a_cumulative_metric(self):
+        # No AppleExerciseTime samples on a day that was otherwise recorded
+        # really is zero exercise; dropping it would let months of inactivity
+        # masquerade as months of missing data.
+        rows = hist_rows(exercise_minutes=[30, None, 10])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], day_list(3))
+        self.assertEqual(series[HISTORY_START + timedelta(days=1)], 0.0)
+
+    def test_blank_day_stays_missing_for_a_reading(self):
+        rows = hist_rows(hrv_sdnn=[50, None, 60])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['hrv_sdnn'], day_list(3))
+        self.assertNotIn(HISTORY_START + timedelta(days=1), series)
+
+    def test_a_day_with_no_row_at_all_is_never_zero_filled(self):
+        rows = hist_rows(exercise_minutes=[30, 30, 30])
+        del rows[1]
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], day_list(3))
+        self.assertNotIn(HISTORY_START + timedelta(days=1), series)
+
+
+class TestPersonalRecords(unittest.TestCase):
+    def _records(self, column, values):
+        rows = hist_rows(**{column: values})
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        metric = METRICS_BY_COLUMN[column]
+        days = day_list(len(values))
+        return {r.scope: r for r in compute_records(build_metric_series(by_date, metric, days),
+                                                    days, metric)}
+
+    def test_ties_report_the_earliest_day_and_count_the_rest(self):
+        records = self._records('exercise_minutes', [90, 20, 90, 10])
+        self.assertEqual(records['day'].period, '2025-01-01')
+        self.assertEqual(records['day'].ties, 1)
+
+    def test_lower_is_better_metric_records_its_minimum(self):
+        records = self._records('resting_hr', [60, 52, 58, 61])
+        self.assertEqual(records['day'].per_day, 52)
+        self.assertEqual(records['day'].period, '2025-01-02')
+
+    def test_rolling_window_record_reports_mean_and_total(self):
+        # 10 quiet days, then a hard week.
+        records = self._records('exercise_minutes', [0] * 10 + [60] * 7)
+        self.assertAlmostEqual(records['7d'].per_day, 60.0)
+        self.assertAlmostEqual(records['7d'].total, 420.0)
+        self.assertEqual(records['7d'].period, '2025-01-11..2025-01-17')
+
+    def test_a_truncated_calendar_month_cannot_hold_a_record(self):
+        # Two days of January must not out-rank nothing else; with fewer than
+        # MIN_MONTH_DAYS in the window there is no month record at all.
+        records = self._records('exercise_minutes', [200, 200])
+        self.assertNotIn('month', records)
+        self.assertNotIn('week', records)
+
+    def test_thin_coverage_blocks_a_window_record(self):
+        # Two measured nights inside a week is not a week of sleep.
+        values = [None] * 5 + [9.0, 9.0] + [7.0] * 21
+        records = self._records('sleep_asleep_hours', values)
+        self.assertNotEqual(records['7d'].period, '2025-01-01..2025-01-07')
+
+    def test_empty_metric_produces_no_records(self):
+        rows = hist_rows(exercise_minutes=[1, 2])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        metric = METRICS_BY_COLUMN['vo2max']
+        days = day_list(2)
+        series = build_metric_series(by_date, metric, days)
+        self.assertEqual(compute_records(series, days, metric), [])
+
+
+class TestCapacityGap(unittest.TestCase):
+    def _capacity(self, column, values):
+        rows = hist_rows(**{column: values})
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        metric = METRICS_BY_COLUMN[column]
+        days = day_list(len(values))
+        return compute_capacity(build_metric_series(by_date, metric, days), days, metric)
+
+    def test_current_is_measured_against_the_best_sustained_block(self):
+        cap = self._capacity('exercise_minutes', [100] * 28 + [10] * 28)
+        self.assertAlmostEqual(cap.current, 10.0)
+        self.assertAlmostEqual(cap.best, 100.0)
+        self.assertEqual(cap.best_period, '2025-01-01..2025-01-28')
+        self.assertAlmostEqual(cap.pct_of_peak, 10.0)
+
+    def test_percent_of_peak_inverts_when_lower_is_better(self):
+        # 50 bpm then 60 bpm: the current period is worse, so it must read
+        # below 100%, not above it.
+        cap = self._capacity('resting_hr', [50] * 28 + [60] * 28)
+        self.assertAlmostEqual(cap.best, 50.0)
+        self.assertAlmostEqual(cap.pct_of_peak, 100.0 * 50 / 60)
+
+    def test_a_record_shorter_than_the_window_still_reports_current(self):
+        cap = self._capacity('exercise_minutes', [20, 40])
+        self.assertAlmostEqual(cap.current, 30.0)
+        self.assertIsNone(cap.best)          # no full 28-day window exists yet
+        self.assertIsNone(cap.pct_of_peak)
+        self.assertEqual(cap.windows, 0)
+
+    def test_percentile_places_the_current_window_in_its_own_history(self):
+        cap = self._capacity('exercise_minutes', [100] * 28 + [10] * 28)
+        self.assertLess(cap.percentile, 20.0)
+
+
+class TestEraSegmentation(unittest.TestCase):
+    def _eras(self, values, **kwargs):
+        rows = hist_rows(exercise_minutes=values)
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        days = day_list(len(values))
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], days)
+        return segment_eras(series, days, {}, **kwargs)
+
+    def test_a_regime_change_becomes_two_eras(self):
+        eras = self._eras([80] * 60 + [0] * 60)
+        self.assertEqual(len(eras), 2)
+        self.assertEqual([e.band for e in eras], ['peak', 'dormant'])
+        self.assertEqual(eras[0].start, HISTORY_START)
+        self.assertEqual(eras[1].end, HISTORY_START + timedelta(days=119))
+        self.assertEqual(eras[0].days + eras[1].days, 120)
+
+    def test_a_steady_record_is_one_era(self):
+        eras = self._eras([40] * 90)
+        self.assertEqual(len(eras), 1)
+        self.assertEqual(eras[0].band, 'active')
+
+    def test_a_stretch_below_the_minimum_is_absorbed_into_its_longer_neighbour(self):
+        # A brief burst inside a long steady stretch is a wobble, not a regime.
+        eras = self._eras([40] * 45 + [300] * 5 + [40] * 45, min_era_days=60)
+        self.assertEqual(len(eras), 1)
+        self.assertEqual(eras[0].days, 95)
+
+    def test_adjacent_eras_never_share_a_band(self):
+        eras = self._eras([80] * 50 + [0] * 50 + [80] * 50)
+        bands = [e.band for e in eras]
+        self.assertEqual(bands, ['peak', 'dormant', 'peak'])
+        for earlier, later in zip(bands, bands[1:], strict=False):
+            self.assertNotEqual(earlier, later)
+
+    def test_eras_cover_every_day_without_overlap(self):
+        eras = self._eras([80] * 40 + [5] * 40 + [45] * 40)
+        self.assertEqual(eras[0].start, HISTORY_START)
+        for earlier, later in zip(eras, eras[1:], strict=False):
+            self.assertEqual(later.start - earlier.end, timedelta(days=1))
+        self.assertEqual(sum(e.days for e in eras), 120)
+
+    def test_no_load_data_produces_no_eras(self):
+        self.assertEqual(segment_eras({}, day_list(30), {}), [])
+
+    def test_era_context_averages_only_the_days_in_that_era(self):
+        rows = hist_rows(exercise_minutes=[80] * 60 + [0] * 60,
+                         hrv_sdnn=[70] * 60 + [40] * 60)
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        days = day_list(120)
+        load = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], days)
+        hrv = build_metric_series(by_date, METRICS_BY_COLUMN['hrv_sdnn'], days)
+        eras = segment_eras(load, days, {'hrv_sdnn': hrv})
+        self.assertGreater(eras[0].context['hrv_sdnn'], eras[-1].context['hrv_sdnn'])
+
+
+class TestStreaks(unittest.TestCase):
+    def _streak(self, column, values, threshold):
+        rows = hist_rows(**{column: values})
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        metric = METRICS_BY_COLUMN[column]
+        days = day_list(len(values))
+        series = build_metric_series(by_date, metric, days)
+        return compute_streak(series, days, StreakRule(column, threshold, 'test'))
+
+    def test_longest_streak_reports_its_own_dates(self):
+        streak = self._streak('exercise_minutes', [40, 40, 40, 0, 40, 40], 30)
+        self.assertEqual(streak.longest, 3)
+        self.assertEqual(streak.longest_start, HISTORY_START)
+        self.assertEqual(streak.longest_end, HISTORY_START + timedelta(days=2))
+        self.assertEqual(streak.days_met, 5)
+
+    def test_current_streak_counts_only_the_tail(self):
+        streak = self._streak('exercise_minutes', [40, 40, 40, 0, 40, 40], 30)
+        self.assertEqual(streak.current, 2)
+
+    def test_a_streak_broken_on_the_last_day_reports_zero(self):
+        streak = self._streak('exercise_minutes', [40, 40, 0], 30)
+        self.assertEqual(streak.current, 0)
+        self.assertEqual(streak.longest, 2)
+
+    def test_an_unmeasured_night_breaks_a_sleep_streak(self):
+        # Levels are not zero-filled, so the blank is a gap, not a bad night —
+        # but it is still not evidence of seven hours' sleep.
+        streak = self._streak('sleep_asleep_hours', [8, 8, None, 8], 7)
+        self.assertEqual(streak.longest, 2)
+        self.assertEqual(streak.current, 1)
+
+    def test_the_whole_record_can_be_one_streak(self):
+        streak = self._streak('exercise_minutes', [40] * 10, 30)
+        self.assertEqual(streak.longest, 10)
+        self.assertEqual(streak.current, 10)
+
+    def test_a_value_exactly_on_the_threshold_counts(self):
+        streak = self._streak('exercise_minutes', [30, 30], 30)
+        self.assertEqual(streak.longest, 2)
+
+
+class TestStrainEpisodes(unittest.TestCase):
+    @staticmethod
+    def flagged(day, detail, count=2):
+        return {'date': day, 'strain_flag': 'yes', 'strain_signal_count': count,
+                'strain_detail': detail}
+
+    def test_flagged_days_across_a_short_gap_are_one_episode(self):
+        rows = [self.flagged('2025-03-01', 'resting HR +4.0 bpm; HRV -1.2 SD below baseline'),
+                {'date': '2025-03-02', 'strain_flag': '', 'strain_detail': ''},
+                {'date': '2025-03-03', 'strain_flag': '', 'strain_detail': ''},
+                self.flagged('2025-03-04', 'wrist temp +0.50degC; HRV -1.5 SD below baseline')]
+        episodes = group_strain_episodes(rows)
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0].span_days, 4)
+        self.assertEqual(episodes[0].flagged_days, 2)
+
+    def test_a_longer_gap_splits_the_episode(self):
+        rows = [self.flagged('2025-03-01', 'resting HR +4.0 bpm; HRV -1.2 SD'),
+                self.flagged('2025-03-06', 'resting HR +4.0 bpm; HRV -1.2 SD')]
+        episodes = group_strain_episodes(rows)
+        self.assertEqual(len(episodes), 2)
+
+    def test_episode_keeps_the_peak_signal_count_and_the_union_of_signals(self):
+        rows = [self.flagged('2025-03-01', 'resting HR +4.0 bpm; HRV -1.2 SD', count=2),
+                self.flagged('2025-03-02', 'wrist temp +0.60degC; SpO2 -1.8 SD', count=4)]
+        episode = group_strain_episodes(rows)[0]
+        self.assertEqual(episode.peak_signals, 4)
+        self.assertEqual(episode.signals, ['resting HR', 'HRV', 'wrist temp', 'SpO2'])
+
+    def test_unflagged_rows_are_ignored(self):
+        rows = [{'date': '2025-03-01', 'strain_flag': '', 'strain_detail': 'HRV -1.0 SD'}]
+        self.assertEqual(group_strain_episodes(rows), [])
+
+    def test_signal_kind_drops_the_measurement(self):
+        self.assertEqual(signal_kind('wrist temp +0.45degC'), 'wrist temp')
+        self.assertEqual(signal_kind('HRV -1.2 SD below baseline'), 'HRV')
+        self.assertEqual(signal_kind('respiratory rate +1.1/min'), 'respiratory rate')
+        self.assertEqual(signal_kind('resting HR +3.0 bpm'), 'resting HR')
+
+
+class TestPercentiles(unittest.TestCase):
+    def test_median_of_an_even_sample(self):
+        self.assertAlmostEqual(percentile([1, 2, 3, 4], 50), 2.5)
+
+    def test_extremes_are_the_extremes(self):
+        self.assertAlmostEqual(percentile([5, 1, 9], 0), 1)
+        self.assertAlmostEqual(percentile([5, 1, 9], 100), 9)
+
+    def test_a_single_value_is_every_percentile(self):
+        self.assertAlmostEqual(percentile([7], 10), 7)
+
+    def test_empty_is_none_not_zero(self):
+        self.assertIsNone(percentile([], 50))
+
+
+class TestHistoryAssembly(unittest.TestCase):
+    def test_empty_input_returns_an_empty_result(self):
+        history = build_history([], [], None)
+        self.assertEqual(history.capacity, [])
+        self.assertEqual(history.n_days, 0)
+        self.assertIsNone(history.first_day)
+
+    def test_a_two_day_export_does_not_crash_or_divide_by_zero(self):
+        rows = hist_rows(exercise_minutes=[10, 20], steps=[5000, 6000],
+                         sleep_asleep_hours=[7.0, 8.0])
+        history = build_history(rows, [], None)
+        self.assertEqual(history.n_days, 2)
+        self.assertTrue(history.capacity)
+        self.assertTrue(all(c.windows == 0 for c in history.capacity))
+
+    def test_gaps_in_the_export_are_counted_as_calendar_days(self):
+        # Windows must feel a missing fortnight, so the day axis is the calendar,
+        # not the list of rows that happen to exist.
+        rows = hist_rows(steps=[5000] + [None] * 14 + [6000])
+        del rows[1:15]
+        history = build_history(rows, [], None)
+        self.assertEqual(history.n_days, 16)
+        self.assertEqual(history.days_with_rows, 2)
+
+    def test_analysis_start_trims_earlier_days(self):
+        rows = hist_rows(steps=[5000] * 10)
+        history = build_history(rows, [], HISTORY_START + timedelta(days=5))
+        self.assertEqual(history.first_day, HISTORY_START + timedelta(days=5))
+        self.assertEqual(history.n_days, 5)
+
+    def test_llm_context_leads_with_the_capacity_gap(self):
+        rows = hist_rows(exercise_minutes=[90] * 40 + [5] * 40,
+                         steps=[12000] * 40 + [4000] * 40)
+        history = build_history(rows, [], None)
+        text = render_llm_context(rows, [], [], [], HISTORY_START, history)
+        self.assertIn('## Capacity gap', text)
+        self.assertLess(text.index('## Capacity gap'), text.index('## Personal records'))
+        self.assertIn('What this data cannot tell you', text)
+        self.assertNotIn('None', text)
 
 
 class TestRegistryIntegrity(unittest.TestCase):

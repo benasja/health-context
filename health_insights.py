@@ -18,6 +18,8 @@ from datetime import date, timedelta
 from typing import Any
 from collections.abc import Sequence
 
+import health_history
+from health_history import HistoryResult
 from health_metrics import CARRY_FORWARD
 
 # Rolling baseline configuration
@@ -569,6 +571,27 @@ def compute_trends(
 # Reports
 # ---------------------------------------------------------------------------
 
+THIN_COVERAGE_PCT = 60.0
+
+
+def thinly_covered_metrics(coverage: list[dict[str, Any]]) -> list[str]:
+    """Key history metrics measured on too few days to lean on.
+
+    Sparse-by-design metrics are included rather than excused: VO2 max really is
+    emitted a handful of times a month, and a model reading a VO2 max percentile
+    in llm_context.md has no other way to learn that.
+    """
+    out: list[str] = []
+    for row in coverage:
+        column = row.get('column')
+        if column not in health_history.METRICS_BY_COLUMN:
+            continue
+        pct = to_float(row.get('coverage_pct_since_reliable_start'))
+        if pct is not None and pct < THIN_COVERAGE_PCT:
+            out.append(f'{column} ({pct:.0f}% of days)')
+    return out
+
+
 def _fmt(value: Any, suffix: str = '') -> str:
     if value in ('', None):
         return 'n/a'
@@ -583,6 +606,7 @@ def render_insights_report(
     start: date | None,
     coverage: list[dict[str, Any]],
     withheld_trends: list[dict[str, str]] | None = None,
+    history: HistoryResult | None = None,
 ) -> str:
     lines: list[str] = ['# Health insights', '']
     if start:
@@ -600,6 +624,15 @@ def render_insights_report(
                      + ', '.join(f'{wear.get(k, 0)} {k}' for k in ('full', 'partial', 'minimal', 'none'))
                      + ' wear.')
         lines.append('')
+
+    # --- historical anchor
+    #
+    # Deliberately above recovery and trends: a recovery score and a 30-vs-90-day
+    # trend are both computed against a baseline that drifts with you, so on their
+    # own they can describe a two-year decline as "steady". The capacity table is
+    # the only place the report says how far today is from what you have held.
+    if history is not None:
+        lines.extend(health_history.render_history_highlights(history))
 
     # --- current state
     scored = [r for r in insight_rows if r.get('recovery_score') != '']
@@ -747,28 +780,52 @@ def render_llm_context(
     trends: list[dict[str, Any]],
     associations: list[dict[str, Any]],
     start: date | None,
+    history: HistoryResult | None = None,
+    thin_metrics: Sequence[str] = (),
     recent_days: int = 28,
 ) -> str:
     """A compact, pre-analysed brief to paste into an LLM.
 
     Pasting 600 rows of daily_metrics.csv burns context and invites the model to
     do arithmetic badly. This hands over the conclusions and the recent detail.
+
+    Ordered by decision-relevance rather than by how the numbers were computed.
+    The historical anchor comes first because without it every level in the file
+    is uninterpretable: 10 min/day of exercise is unremarkable for one person and
+    a collapse for another, and only this subject's own record says which.
     """
+    history = history or HistoryResult()
     lines = ['# Health context pack', '']
-    lines.append('Pre-computed from an Apple Health export. All baselines are the subject\'s own '
-                 'rolling 60-day history. Do not re-derive these numbers; reason about them.')
+    lines.append('Pre-computed from one person\'s Apple Health export. Rolling baselines are their '
+                 'own 60-day history; records and percentiles are their own whole record. Do not '
+                 're-derive these numbers, reason about them. Sections are ordered most to least '
+                 'decision-relevant. Read "What this data cannot tell you" at the end before '
+                 'drawing conclusions.')
     lines.append('')
 
     if start:
-        lines.append(f'- Valid analysis window begins: {start.isoformat()}')
+        lines.append(f'- Valid analysis window begins: {start.isoformat()} '
+                     '(first date on which resting HR, HRV and staged sleep are all live)')
     if insight_rows:
         lines.append(f'- Days analysed: {len(insight_rows)}')
         full = sum(1 for r in insight_rows if r.get('wear_class') == 'full')
         lines.append(f'- Days with full watch wear: {full}')
     lines.append('')
 
+    lines.extend(health_history.render_situation(history))
+    lines.extend(health_history.render_capacity(history))
+    lines.extend(health_history.render_records(history))
+    lines.extend(health_history.render_eras(history))
+    lines.extend(health_history.render_yearly(history))
+    lines.extend(health_history.render_cycles(history))
+    lines.extend(health_history.render_distributions(history))
+    lines.extend(health_history.render_streaks(history))
+
     if trends:
         lines.append('## Direction of travel (last 30d vs prior 90d)')
+        lines.append('')
+        lines.append('Short-horizon only. Both periods sit inside the current era, so a "flat" '
+                     'reading here can still be far below the capacity table above.')
         lines.append('')
         for t in trends:
             verdict = f", {t['verdict']}" if t['verdict'] else ''
@@ -780,24 +837,26 @@ def render_llm_context(
     if notable:
         lines.append('## Statistically notable personal associations')
         lines.append('')
+        lines.append(f'Correlations over paired days (min {MIN_PAIRS} pairs, |t| > 2). '
+                     'Association, not cause.')
+        lines.append('')
         for a in notable:
-            lines.append(f"- {a['label']}: r={a['r']:+} (n={a['n']})")
+            lines.append(f"- {a['label']}: r={a['r']:+} (n={a['n']}, lag {a['lag_days']}d)")
         lines.append('')
 
-    flagged = [r for r in insight_rows if r.get('strain_flag') == 'yes']
-    if flagged:
-        lines.append('## Multi-signal strain days')
-        lines.append('')
-        for r in flagged[-15:]:
-            lines.append(f"- {r['date']}: {r['strain_detail']}")
-        lines.append('')
+    lines.extend(health_history.render_episodes(history))
 
     recent = insight_rows[-recent_days:]
     if recent:
-        lines.append(f'## Last {len(recent)} days (detail)')
+        lines.append(f'## Last {len(recent)} day{"s" if len(recent) != 1 else ""} (detail)')
         lines.append('')
-        lines.append('| date | wear | recovery | HRV z | RHR dev | sleep h | deep h | REM h | load ratio |')
-        lines.append('|---|---|---|---|---|---|---|---|---|')
+        lines.append('Units: recovery 0-100 (70 = at baseline), HRV z and RHR dev are vs the '
+                     '60-day personal baseline, sleep/deep/REM in hours, load ratio is 7d:28d '
+                     'exercise minutes. `n/a` means not measured.')
+        lines.append('')
+        lines.append('| date | wear | recovery | HRV z | RHR dev | sleep h | deep h | REM h | '
+                     'exercise min | load ratio |')
+        lines.append('|---|---|---|---|---|---|---|---|---|---|')
         daily_by_date = {r['date']: r for r in daily_rows}
         for r in recent:
             d = daily_by_date.get(r['date'], {})
@@ -805,16 +864,21 @@ def render_llm_context(
                 f"| {r['date']} | {r.get('wear_class', '')} | {_fmt(r.get('recovery_score'))} | "
                 f"{_fmt(r.get('hrv_sdnn_z'))} | {_fmt(r.get('resting_hr_dev'))} | "
                 f"{_fmt(d.get('sleep_asleep_hours'))} | {_fmt(d.get('sleep_deep_hours'))} | "
-                f"{_fmt(d.get('sleep_rem_hours'))} | {_fmt(r.get('load_ratio'))} |"
+                f"{_fmt(d.get('sleep_rem_hours'))} | {_fmt(d.get('exercise_minutes'))} | "
+                f"{_fmt(r.get('load_ratio'))} |"
             )
         lines.append('')
+
+    lines.extend(health_history.render_limits(history, thin_metrics))
 
     lines.extend([
         '## How to use this',
         '',
-        'Interpret patterns, name the two or three changes with the largest expected effect, and '
-        'say explicitly when the data cannot answer a question. Blank cells mean "not measured", '
-        'never zero. Days marked `partial`/`minimal`/`none` wear have incomplete data by definition.',
+        'Anchor every judgement on the capacity table, not on the 30d-vs-90d trends: the trends '
+        'compare two points inside the same regime and will call a sustained collapse "flat". '
+        'Name the two or three changes with the largest expected effect, size them against what '
+        'this person has already proven they can hold, and say explicitly when the data cannot '
+        'answer a question. Blank or `n/a` cells mean "not measured", never zero.',
     ])
     return '\n'.join(lines) + '\n'
 
@@ -834,6 +898,8 @@ def write_insight_outputs(
             for driver, outcome, threshold, lag in CONTRASTS
         ) if c
     ]
+    history = health_history.build_history(daily_rows, insight_rows, start)
+    thin_metrics = thinly_covered_metrics(coverage)
 
     paths = {
         'daily_insights': os.path.join(base_dir, 'daily_insights.csv'),
@@ -848,9 +914,10 @@ def write_insight_outputs(
 
     with open(paths['insights_report'], 'w', encoding='utf-8') as f:
         f.write(render_insights_report(insight_rows, trends, associations,
-                                       contrasts, start, coverage, withheld_trends))
+                                       contrasts, start, coverage, withheld_trends, history))
 
     with open(paths['llm_context'], 'w', encoding='utf-8') as f:
-        f.write(render_llm_context(daily_rows, insight_rows, trends, associations, start))
+        f.write(render_llm_context(daily_rows, insight_rows, trends, associations, start,
+                                   history, thin_metrics))
 
     return paths

@@ -132,6 +132,19 @@ does next (sleep → next-day HRV, steps → next-night deep sleep, and so on).
 Reported with `n` and a significance marker; relationships with fewer than 30
 paired days are omitted rather than reported weakly.
 
+**Capacity gap** — your current 28-day mean against the best 28-day mean you
+have ever held, with the date you held it. A rolling baseline drifts with you,
+so on its own it will describe a two-year decline as "slightly worse than
+lately"; this is the number that says 10 min/day is 15% of what you have
+already proven you can sustain.
+
+**Personal records, eras, streaks** — best day, best rolling 7 and 28 days,
+best ISO week and best calendar month for each key metric, all dated; the
+timeline cut into contiguous load regimes with the sleep, HRV, resting HR and
+weight that accompanied each; and longest/current streaks against plain
+thresholds. Percentile tables make every other number in the pack readable, and
+scattered strain days are grouped into episodes with start, end and duration.
+
 ## Metrics captured
 
 Around 45 HealthKit types across activity, cardiovascular, respiratory, sleep,
@@ -169,6 +182,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `health_metrics.py` | Declarative metric registry — units, aggregation, grouping |
 | `health_coaching.py` | Parsing, daily/weekly/workout aggregation, de-duplication, coverage |
 | `health_insights.py` | Baselines, z-scores, scores, flags, trends, associations, reports |
+| `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
 
 ## Privacy

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-"""Convert Apple Health export into flat and coaching-ready CSV outputs."""
+"""Convert an Apple Health export into flat CSV, coaching aggregates and insights."""
 
+import argparse
 import csv
 import glob
 import os
@@ -11,10 +12,15 @@ from datetime import datetime
 from health_coaching import (
     COACHING_RECORD_TYPES,
     ExportData,
+    HealthRecord,
+    ingest_record,
     iter_export_xml,
+    parse_float,
+    parse_health_datetime,
     records_to_legacy_rows,
     write_coaching_outputs,
 )
+from health_insights import write_insight_outputs
 
 
 def format_cda_date(date_str: str) -> str:
@@ -71,19 +77,15 @@ def parse_export_cda_into_data(filepath: str, data: ExportData) -> int:
                 if high is not None:
                     end_date = format_cda_date(high.get('value', ''))
 
-            creation_date = start_date
-            key = (creation_date, start_date, end_date, record_type, value_raw, 'cda')
-            if key in data.seen_record_keys:
+            if data.mark_seen(start_date, start_date, end_date, record_type, value_raw or '', 'cda'):
                 elem.clear()
                 continue
-            data.seen_record_keys.add(key)
-
-            from health_coaching import HealthRecord, parse_float, parse_health_datetime
 
             start_dt = parse_health_datetime(start_date)
             end_dt = parse_health_datetime(end_date)
             if start_dt and end_dt:
                 numeric = parse_float(value_raw)
+                ingest_record(data, record_type, value_raw or '', '', 'cda', start_dt, end_dt)
                 data.records.append(
                     HealthRecord(
                         type=record_type,
@@ -93,7 +95,7 @@ def parse_export_cda_into_data(filepath: str, data: ExportData) -> int:
                         source_name='cda',
                         start=start_dt,
                         end=end_dt,
-                        creation=creation_date,
+                        creation=start_date,
                         start_raw=start_date,
                         end_raw=end_date,
                     )
@@ -132,15 +134,13 @@ def parse_ecg_legacy(ecg_dir: str, legacy_rows: list, seen_keys: set) -> int:
             if record_key in seen_keys:
                 continue
             seen_keys.add(record_key)
-            legacy_rows.append(
-                {
-                    'creationDate': recorded_date,
-                    'startDate': recorded_date,
-                    'endDate': recorded_date,
-                    'type': 'ECG',
-                    'value': classification,
-                }
-            )
+            legacy_rows.append({
+                'creationDate': recorded_date,
+                'startDate': recorded_date,
+                'endDate': recorded_date,
+                'type': 'ECG',
+                'value': classification,
+            })
             count += 1
         except OSError as e:
             print(f"  Warning: Could not parse {filepath}: {e}")
@@ -149,12 +149,38 @@ def parse_ecg_legacy(ecg_dir: str, legacy_rows: list, seen_keys: set) -> int:
     return count
 
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description='Convert an Apple Health export into CSVs and an insights report.',
+    )
+    p.add_argument('--data-dir', default=None,
+                   help='Directory holding export.xml (default: alongside this script)')
+    p.add_argument('--out-dir', default=None,
+                   help='Where to write outputs (default: same as --data-dir)')
+    p.add_argument('--max-hr', type=float, default=None,
+                   help='Max heart rate for zone maths. Default: highest value seen in the export.')
+    p.add_argument('--age', type=int, default=None,
+                   help='Age, used to sanity-check max HR when no higher value was recorded.')
+    p.add_argument('--skip-legacy', action='store_true',
+                   help='Skip the large flat full_health_data.csv (much faster).')
+    p.add_argument('--include-cda', action='store_true',
+                   help='Also parse export_cda.xml. Off by default: it is a clinical-document '
+                        'mirror of export.xml whose records cannot be matched against the main '
+                        'export for de-duplication, so including it double-counts summed metrics '
+                        'like steps and calories.')
+    return p
+
+
 def main() -> None:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    args = build_parser().parse_args()
+
+    base_dir = os.path.abspath(args.data_dir or os.path.dirname(os.path.abspath(__file__)))
+    out_dir = os.path.abspath(args.out_dir or base_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
     export_xml = os.path.join(base_dir, 'export.xml')
     export_cda_xml = os.path.join(base_dir, 'export_cda.xml')
     ecg_dir = os.path.join(base_dir, 'electrocardiograms')
-    output_csv = os.path.join(base_dir, 'full_health_data.csv')
 
     data = ExportData()
 
@@ -165,38 +191,51 @@ def main() -> None:
     if os.path.exists(export_xml):
         iter_export_xml(export_xml, data)
     else:
-        print(f"Warning: {export_xml} not found")
+        print(f"Error: {export_xml} not found. Point --data-dir at your unzipped export.")
+        return
 
-    if os.path.exists(export_cda_xml):
+    if not args.include_cda:
+        print('Skipping export_cda.xml (pass --include-cda to parse it as well)')
+    elif os.path.exists(export_cda_xml):
         parse_export_cda_into_data(export_cda_xml, data)
     else:
-        print(f"Warning: {export_cda_xml} not found")
+        print(f"Note: {export_cda_xml} not found (optional)")
 
-    legacy_rows = records_to_legacy_rows(data)
-    ecg_seen = {(r['creationDate'], r['startDate'], r['endDate'], r['type'], r['value']) for r in legacy_rows}
-    if os.path.exists(ecg_dir):
-        parse_ecg_legacy(ecg_dir, legacy_rows, ecg_seen)
+    output_csv = os.path.join(out_dir, 'full_health_data.csv')
+    legacy_rows = []
+    if args.skip_legacy:
+        print('Skipping full_health_data.csv (--skip-legacy)')
     else:
-        print(f"Warning: {ecg_dir} not found")
-
-    legacy_rows.sort(key=lambda x: x['startDate'])
-    print(f"\nWriting legacy export: {output_csv}")
-    with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['creationDate', 'startDate', 'endDate', 'type', 'value'])
-        writer.writeheader()
-        writer.writerows(legacy_rows)
+        legacy_rows = records_to_legacy_rows(data)
+        ecg_seen = {(r['creationDate'], r['startDate'], r['endDate'], r['type'], r['value'])
+                    for r in legacy_rows}
+        if os.path.exists(ecg_dir):
+            parse_ecg_legacy(ecg_dir, legacy_rows, ecg_seen)
+        legacy_rows.sort(key=lambda x: x['startDate'])
+        print(f"\nWriting legacy export: {output_csv}")
+        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(
+                f, fieldnames=['creationDate', 'startDate', 'endDate', 'type', 'value'])
+            writer.writeheader()
+            writer.writerows(legacy_rows)
 
     print('\nBuilding coaching-ready outputs...')
-    coaching_paths = write_coaching_outputs(base_dir, data)
+    result = write_coaching_outputs(out_dir, data, max_hr_override=args.max_hr, age=args.age)
+
+    print('Building insights...')
+    insight_paths = write_insight_outputs(
+        out_dir, result.daily_rows, result.coverage, result.analysis_start)
 
     print()
     print('=' * 60)
     print('COMPLETE')
     print('=' * 60)
-    print(f"Legacy rows: {len(legacy_rows):,} -> {output_csv}")
-    for name, path in coaching_paths.items():
+    if legacy_rows:
+        print(f"Legacy rows: {len(legacy_rows):,} -> {output_csv}")
+    for name, path in {**result.paths, **insight_paths}.items():
         print(f"  {name}: {path}")
-    print(f"\nSee {coaching_paths['data_quality_report']} for type coverage and missingness.")
+    print(f"\nStart with {insight_paths['insights_report']}")
+    print(f"Paste {insight_paths['llm_context']} into an LLM for coaching.")
 
 
 if __name__ == '__main__':

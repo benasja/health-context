@@ -1,11 +1,26 @@
+# --- Raw export data (never commit: health data in git history is forever) ---
 export.xml
 export_cda.xml
+export.zip
+*.zip
+apple_health_export/
+electrocardiograms/
+electrocardiograms
+workout-routes/
+
+# --- Generated outputs (all derived from personal health data) ---
 full_health_data.csv
 daily_metrics.csv
+daily_insights.csv
 workout_summary.csv
 weekly_summary.csv
+metric_coverage.csv
 available_types.csv
 data_quality_report.txt
 coaching_types_usage.txt
-electrocardiograms/
+insights_report.md
+llm_context.md
+
+# --- Junk ---
 __pycache__/
+.DS_Store

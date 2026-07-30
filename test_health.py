@@ -1658,5 +1658,69 @@ class TestScheduleGeneration(unittest.TestCase):
         self.assertIn('[Timer]', text)
 
 
+class TestProfile(unittest.TestCase):
+    """The export records what a body did and can never record why. Without a
+    profile every reader fills that gap with a guess, and the usual guess is
+    that a decline means lost motivation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _write(self, text, name='profile.md'):
+        path = os.path.join(self.tmp, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return path
+
+    def test_an_unedited_template_counts_as_no_profile(self):
+        # A profile that is only the template's own prompts looks like context
+        # while saying nothing, which is worse than admitting there is none.
+        with open('profile.example.md', encoding='utf-8') as f:
+            template = f.read()
+        self.assertEqual(health_ingest.load_profile(self._write(template)), '')
+
+    def test_a_real_profile_is_returned(self):
+        path = self._write('# Profile\n\n## Constraints\n- Wrist surgery Nov 2025\n')
+        self.assertIn('Wrist surgery', health_ingest.load_profile(path))
+
+    def test_template_comments_are_stripped(self):
+        path = self._write('## Goals\n<!-- be specific, e.g. rebuild strength -->\n- Run 10k\n')
+        loaded = health_ingest.load_profile(path)
+        self.assertIn('Run 10k', loaded)
+        self.assertNotIn('be specific', loaded)
+
+    def test_missing_file_is_empty_not_an_error(self):
+        self.assertEqual(health_ingest.load_profile(None), '')
+        self.assertEqual(health_ingest.load_profile('/nonexistent/profile.md'), '')
+
+    def test_find_profile_prefers_the_first_directory(self):
+        other = tempfile.mkdtemp()
+        with open(os.path.join(other, 'profile.md'), 'w') as f:
+            f.write('second')
+        self._write('first')
+        self.assertEqual(health_ingest.find_profile(self.tmp, other),
+                         os.path.join(self.tmp, 'profile.md'))
+
+    def test_find_profile_returns_none_when_absent(self):
+        self.assertIsNone(health_ingest.find_profile(self.tmp))
+
+    def test_pack_states_plainly_when_no_profile_exists(self):
+        text = render_llm_context([], [], [], None, profile='')
+        self.assertIn('No profile provided', text)
+        self.assertIn('do not read a decline in training as lost motivation', text)
+
+    def test_pack_tells_the_reader_to_believe_the_profile_over_inference(self):
+        text = render_llm_context([], [], [], None, profile='- Wrist surgery Nov 2025')
+        self.assertIn('Wrist surgery', text)
+        self.assertIn('believe this', text)
+
+    def test_profile_precedes_every_metric_section(self):
+        # It has to be read before the numbers, or it cannot reframe them.
+        text = render_llm_context([], [], [], None, profile='- Recovering from surgery')
+        # Match the heading, not the preamble's reference to it by name.
+        self.assertLess(text.index('## Who this is'),
+                        text.index('## What this data cannot tell you'))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

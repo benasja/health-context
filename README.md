@@ -319,6 +319,34 @@ instead of calling `health_list_metrics` first, then report "no data" for a
 metric that exists under another name. Anything competent at function calling
 handles this; the smallest models will need the metric name given to them.
 
+## Tell it what the data cannot know
+
+The export records what your body did. It has no idea *why*. Without that,
+anything reading it fills the gap with a guess — and the usual guess is that a
+drop in training means you lost motivation, when it might have been surgery.
+
+Copy the template and write three honest lines:
+
+```bash
+cp profile.example.md profile.md
+```
+
+```markdown
+## Constraints
+- TFCC surgery Nov 2025. No loaded wrist extension yet.
+
+## Context for the data
+- The training drop from Oct 2025 is medical, not motivational.
+- I am NOT trying to return to January 2025 volume.
+```
+
+It is picked up automatically, placed at the very top of the context pack ahead
+of every number, and exposed as the `health_profile` MCP tool. The pack tells the
+reader to believe it over anything inferred from the data. With no profile, it
+says so explicitly and instructs the reader not to guess.
+
+`profile.md` is gitignored. Only the template ships.
+
 ## Keeping it up to date automatically
 
 **Apple provides no way to trigger an export programmatically** — no API, no

@@ -876,6 +876,7 @@ def render_llm_context(
     history: HistoryResult | None = None,
     thin_metrics: Sequence[str] = (),
     recent_days: int = 28,
+    profile: str = '',
 ) -> str:
     """A compact, pre-analysed brief to paste into an LLM.
 
@@ -895,6 +896,30 @@ def render_llm_context(
                  'decision-relevant. Read "What this data cannot tell you" at the end before '
                  'drawing conclusions.')
     lines.append('')
+
+    # First, because it reframes everything after it. The export records what a
+    # body did and can never record why; this is the only part that can.
+    if profile:
+        lines.extend([
+            '## Who this is, in their own words',
+            '',
+            'Written by the subject, not derived from the data. It is the only part of this '
+            'file that can explain *why*, so where it conflicts with an inference drawn from '
+            'the numbers, believe this.',
+            '',
+            profile,
+            '',
+        ])
+    else:
+        lines.extend([
+            '## No profile provided',
+            '',
+            'The subject has not supplied goals, constraints or context. **Do not guess at '
+            'them.** In particular, do not read a decline in training as lost motivation — '
+            'injury, illness, surgery, work and caring responsibilities all produce the same '
+            'shape in this data, and none of them are recorded here. Ask.',
+            '',
+        ])
 
     if start:
         lines.append(f'- Valid analysis window begins: {start.isoformat()} '
@@ -983,6 +1008,7 @@ def write_insight_outputs(
     start: date | None,
     workout_rows: Sequence[dict[str, Any]] = (),
     max_hr: float | None = None,
+    profile: str = '',
 ) -> dict[str, str]:
     suspect_days = isolated_spikes(daily_rows, start)
     insight_rows = build_daily_insights(daily_rows, start, suspect_days)
@@ -1015,6 +1041,6 @@ def write_insight_outputs(
 
     with open(paths['llm_context'], 'w', encoding='utf-8') as f:
         f.write(render_llm_context(daily_rows, insight_rows, associations, start,
-                                   history, thin_metrics))
+                                   history, thin_metrics, profile=profile))
 
     return paths

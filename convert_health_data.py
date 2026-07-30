@@ -168,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Age, used to sanity-check max HR when no higher value was recorded.')
     p.add_argument('--skip-legacy', action='store_true',
                    help='Skip the large flat full_health_data.csv (much faster).')
+    p.add_argument('--profile', default=None,
+                   help='Path to your profile.md (goals, constraints, context). '
+                        'Default: profile.md in the output folder or next to this script. '
+                        'Copy profile.example.md to start one.')
     p.add_argument('--print-schedule', action='store_true',
                    help='Print a ready-to-install monthly scheduled job for this OS '
                         '(launchd / systemd / Task Scheduler), then exit.')
@@ -269,10 +273,19 @@ def main() -> None:
     print('\nBuilding coaching-ready outputs...')
     result = write_coaching_outputs(out_dir, data, max_hr_override=args.max_hr, age=args.age)
 
+    profile_path = args.profile or health_ingest.find_profile(
+        out_dir, os.path.dirname(os.path.abspath(__file__)))
+    profile = health_ingest.load_profile(profile_path)
+    if profile:
+        print(f'Profile: {profile_path}')
+    else:
+        print('Profile: none — add profile.md so an analysis knows your goals '
+              '(see profile.example.md)')
+
     print('Building insights...')
     insight_paths = write_insight_outputs(
         out_dir, result.daily_rows, result.coverage, result.analysis_start,
-        result.workout_rows, result.max_hr)
+        result.workout_rows, result.max_hr, profile=profile)
 
     print()
     print('=' * 60)

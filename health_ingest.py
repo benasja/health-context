@@ -218,3 +218,52 @@ def schedule_instructions(python: str, script: str, watch: str, out: str,
         '#   systemctl --user enable --now health-context.timer\n\n'
         f'{service}\n--- timer ---\n\n{SYSTEMD_TIMER}'
     )
+
+
+# ---------------------------------------------------------------------------
+# User-supplied context
+# ---------------------------------------------------------------------------
+
+PROFILE_NAME = 'profile.md'
+PROFILE_TEMPLATE = 'profile.example.md'
+
+# Headings in the template that carry no user text yet. A profile consisting
+# only of these is worse than none: it looks like context while saying nothing.
+_TEMPLATE_MARKER = 'Copy this to `profile.md` and edit it'
+
+
+def find_profile(*directories: str) -> str | None:
+    """First profile.md found across the given directories."""
+    for directory in directories:
+        if not directory:
+            continue
+        candidate = os.path.join(directory, PROFILE_NAME)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_profile(path: str | None) -> str:
+    """Read the user's profile, ignoring an unedited template copy."""
+    if not path or not os.path.isfile(path):
+        return ''
+    with open(path, encoding='utf-8') as f:
+        text = f.read()
+    if _TEMPLATE_MARKER in text:
+        return ''
+
+    # Strip HTML comments (the template's prompts) and empty bullets, so a
+    # half-filled profile does not present its own instructions as facts.
+    out, skipping = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if '<!--' in stripped:
+            skipping = True
+        if skipping:
+            if '-->' in stripped:
+                skipping = False
+            continue
+        if stripped in ('-', '*', '') and (not out or not out[-1].strip()):
+            continue
+        out.append(line)
+    return '\n'.join(out).strip()

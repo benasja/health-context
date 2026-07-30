@@ -21,6 +21,9 @@ coaching_types_usage.txt
 insights_report.md
 llm_context.md
 
+# --- Personal context (yours alone; the template is what ships) ---
+profile.md
+
 # --- Junk ---
 __pycache__/
 .ruff_cache/

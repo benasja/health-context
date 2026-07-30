@@ -657,6 +657,25 @@ def _context_pack(data: HealthData, args: dict[str, Any]) -> str:
 
 
 @tool(
+    'health_profile',
+    "The subject's own stated goals, constraints and context — age, injuries, what "
+    'they are training for, what they have deliberately stopped. The export records '
+    'what a body did and can never record why; this is the only source for that. Read '
+    'it before interpreting any decline or change.',
+    obj({}),
+)
+def _profile(data: HealthData, _args: dict[str, Any]) -> str:
+    doc = data.doc('context')
+    sections = markdown_sections(doc) if doc else {}
+    for name, body in sections.items():
+        if 'own words' in name.lower() or name.lower().startswith('no profile'):
+            return body
+    return ('No profile has been supplied. Do not infer goals, discipline or motivation '
+            'from the numbers — ask. A profile.md can be added next to the data '
+            '(see profile.example.md in the project).')
+
+
+@tool(
     'health_data_quality',
     'How trustworthy the underlying data is: watch-wear rates, per-metric coverage, '
     'excluded sensor artifacts, and which device recorded what. Check this before '

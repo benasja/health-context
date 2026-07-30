@@ -5,27 +5,69 @@ ON YOUR COMPUTER (Mac or Windows)
 ---------------------------------
 
 1. Install Python 3 if needed (https://www.python.org/downloads/)
+   No other packages are required — the standard library is enough.
 
 2. Export Apple Health on your iPhone:
-   Health app → profile picture → Export All Health Data
+   Health app -> profile picture -> Export All Health Data
    Save the zip and unzip it on your computer.
 
 3. Copy export.xml into this folder (same folder as convert_health_data.py).
 
 4. Open Terminal (Mac) or Command Prompt (Windows), cd to this folder, run:
 
-   python3 convert_health_data.py
+      python3 convert_health_data.py
 
    On Windows you may need: py convert_health_data.py
 
-5. Your coaching files appear in this folder:
-   - daily_metrics.csv
-   - workout_summary.csv
-   - weekly_summary.csv
-   - full_health_data.csv
-   - available_types.csv
-   - data_quality_report.txt
+   A large export (around 1 GB) takes roughly a minute. A progress bar shows
+   how far along the parsing is, so silence never means it has hung.
 
-The sample_output/ folder shows example files from demo data (not your health data).
+5. Your files appear in this folder:
 
-To re-run with your real export, delete the old CSV files and run step 4 again.
+   READ THIS FIRST
+   - insights_report.md ..... recovery, strain flags, sleep regularity,
+                              training load, trends, what moves your numbers
+   - llm_context.md ......... compact summary to paste into an LLM for coaching
+
+   DATA
+   - daily_metrics.csv ...... one row per day, 60+ columns
+   - daily_insights.csv ..... per-day baselines, deviations, scores, flags
+   - weekly_summary.csv ..... one row per ISO week
+   - workout_summary.csv .... one row per workout, with heart-rate zones
+   - full_health_data.csv ... flat dump of every record
+
+   DIAGNOSTICS
+   - metric_coverage.csv .... when each metric actually started being tracked
+   - data_quality_report.txt  watch wear, coverage, multi-device warnings
+   - available_types.csv .... every Health type found, with counts
+
+Useful options
+--------------
+
+   python3 convert_health_data.py --skip-legacy
+       Skips the big full_health_data.csv. Much faster.
+
+   python3 convert_health_data.py --max-hr 185
+       Sets max heart rate for training zones. By default it is inferred from
+       your export, so only set this if you know your true max.
+
+   python3 convert_health_data.py --age 30
+       Sanity-checks the inferred max heart rate against your age.
+
+   python3 convert_health_data.py --data-dir /path/to/export --out-dir /path/out
+       Reads and writes elsewhere instead of this folder.
+
+Re-running
+----------
+
+Just run step 4 again — outputs are overwritten, no need to delete anything.
+
+Your privacy
+------------
+
+Nothing is uploaded; the tool makes no network calls. Your export and every
+generated file are excluded from git, so they cannot be committed by accident.
+Keep it that way: health data in git history stays there forever.
+
+Not medical advice. Every baseline is your own, not a population norm, and every
+flag is a prompt to pay attention rather than a diagnosis.

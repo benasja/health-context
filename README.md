@@ -1,8 +1,15 @@
-# Apple Health XML to CSV Converter
+# health-context
 
-Turns an Apple Health export (`export.xml`) into analysis-ready CSVs **and** a
-computed insights report — baselines, deviations, trends and personal
-associations, rather than a pile of rows to eyeball.
+**Your Apple Health data, with enough context to judge it.**
+
+Ask an LLM about your own health and it can only tell you what the last month
+looked like. This computes the part that makes a number mean something — that
+10 minutes a day is 15% of what *you* personally sustained for 28 days in
+January — then hands it over as a briefing, or serves it live over MCP so an
+assistant can query it directly.
+
+Runs entirely on your machine. Nothing is uploaded, no account, no API key.
+Point it at a local model and your health data never leaves the laptop at all.
 
 Python 3.10+. **No dependencies** — standard library only.
 
@@ -32,7 +39,7 @@ zero dependencies.
 If you would rather have the commands on your `PATH`:
 
 ```bash
-pip install git+https://github.com/benasja/xml_csv_converter_applehealth
+pip install git+https://github.com/benasja/health-context
 health-convert --data-dir ~/Downloads/export.zip --out-dir ~/health
 ```
 

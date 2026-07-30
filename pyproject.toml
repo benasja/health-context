@@ -32,8 +32,8 @@ health-convert = "convert_health_data:main"
 health-mcp = "health_mcp:main"
 
 [project.urls]
-Homepage = "https://github.com/benasja/xml_csv_converter_applehealth"
-Issues = "https://github.com/benasja/xml_csv_converter_applehealth/issues"
+Homepage = "https://github.com/benasja/health-context"
+Issues = "https://github.com/benasja/health-context/issues"
 
 [tool.setuptools]
 # Flat single-file modules rather than a package directory: the layout predates

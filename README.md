@@ -199,6 +199,72 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
 
+## Ask questions instead of reading files (MCP server)
+
+Rather than pasting `llm_context.md` into a chat, let the assistant query your
+data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
+server exposing 12 tools over stdio — still zero dependencies, still entirely
+local, nothing uploaded anywhere.
+
+```
+"How did I sleep last week compared with my best month?"
+"What were my ten biggest training days ever?"
+"Was I ill in November? What do the vitals say?"
+"Compare my exercise this month against January 2025."
+```
+
+### Setup
+
+**1.** Generate the data once (repeat whenever you re-export):
+
+```bash
+python3 convert_health_data.py --data-dir apple_health_export --out-dir output
+```
+
+**2.** Check it loads:
+
+```bash
+python3 health_mcp.py --data-dir output --check
+```
+
+**3.** Register it. For **Claude Code**:
+
+```bash
+claude mcp add apple-health -- python3 "$PWD/health_mcp.py" --data-dir "$PWD/output"
+```
+
+For **Claude Desktop** or any other MCP client, print the config block and paste
+it into the client's `mcpServers` object:
+
+```bash
+python3 health_mcp.py --data-dir output --print-config
+```
+
+Claude Desktop keeps that file at
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS.
+Restart the client afterwards.
+
+### Tools
+
+| Tool | Answers |
+|------|---------|
+| `health_overview` | Where things stand now vs what you have sustained before |
+| `health_list_metrics` | What is available and how completely it is covered |
+| `health_metric_stats` | Summary of one metric, and where it sits in your history |
+| `health_compare_periods` | Two date ranges, head to head |
+| `health_top_days` | Best or worst days, dated |
+| `health_day_detail` | Everything about one specific day |
+| `health_sleep` | Duration, stages, efficiency, timing |
+| `health_workouts` | Sessions, or totals by activity type |
+| `health_strain_episodes` | Multi-signal physiological flags, grouped |
+| `health_weekly` | Week-by-week rollup |
+| `health_context_pack` | The whole briefing |
+| `health_data_quality` | Wear rates, coverage, excluded artifacts |
+
+The server reads the generated CSVs, never `export.xml` — parsing a gigabyte of
+XML takes ~40 seconds, which no client will wait for on every call. It reports
+how old the data is, so the model knows when it is answering from a stale export.
+
 ## Development
 
 ```bash

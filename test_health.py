@@ -8,6 +8,10 @@ plausible-looking wrong numbers rather than an error. Stdlib only:
     python3 test_health.py
 """
 
+import csv
+import json
+import os
+import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 
@@ -65,6 +69,17 @@ from health_insights import (
     pearson,
     render_llm_context,
     rolling_baseline,
+)
+from health_mcp import (
+    DEFAULT_PROTOCOL,
+    HANDLERS,
+    TOOLS,
+    HealthData,
+    _compare,
+    _metric_stats,
+    client_config,
+    handle,
+    ordinal,
 )
 from health_metrics import (
     DAILY_SPECS,
@@ -1296,6 +1311,131 @@ class TestCyclingPower(unittest.TestCase):
         self.assertAlmostEqual(summary.best_avg_w, 125.0)
         self.assertEqual(summary.best_day, date(2026, 5, 8))
         self.assertAlmostEqual(summary.max_w, 610.0)
+
+
+class TestMcpOrdinals(unittest.TestCase):
+    """Percentiles are user-facing text; "43th" reads as broken."""
+
+    def test_common_suffixes(self):
+        self.assertEqual(ordinal(1), '1st')
+        self.assertEqual(ordinal(2), '2nd')
+        self.assertEqual(ordinal(3), '3rd')
+        self.assertEqual(ordinal(43), '43rd')
+
+    def test_teens_are_the_exception(self):
+        # A naive last-digit rule produces 11st, 12nd, 13rd.
+        self.assertEqual(ordinal(11), '11th')
+        self.assertEqual(ordinal(12), '12th')
+        self.assertEqual(ordinal(13), '13th')
+        self.assertEqual(ordinal(113), '113th')
+
+    def test_hundreds_wrap_correctly(self):
+        self.assertEqual(ordinal(101), '101st')
+        self.assertEqual(ordinal(0), '0th')
+
+
+class TestMcpProtocol(unittest.TestCase):
+    """The JSON-RPC layer is hand-rolled, so a protocol regression would be
+    invisible to every other test in this file."""
+
+    def setUp(self):
+        self.data = HealthData(tempfile.mkdtemp())
+
+    def test_initialize_echoes_a_supported_protocol(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                        'params': {'protocolVersion': '2024-11-05'}}, self.data)
+        self.assertEqual(reply['result']['protocolVersion'], '2024-11-05')
+
+    def test_unknown_protocol_falls_back_rather_than_failing(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                        'params': {'protocolVersion': '1999-01-01'}}, self.data)
+        self.assertEqual(reply['result']['protocolVersion'], DEFAULT_PROTOCOL)
+
+    def test_notifications_get_no_reply(self):
+        # Answering a notification is a protocol violation; some clients hang up.
+        self.assertIsNone(handle({'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+                                 self.data))
+
+    def test_every_tool_is_listed_with_a_schema(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}, self.data)
+        tools = reply['result']['tools']
+        self.assertEqual(len(tools), len(HANDLERS))
+        for t in tools:
+            self.assertTrue(t['description'].strip(), f"{t['name']} has no description")
+            self.assertEqual(t['inputSchema']['type'], 'object')
+
+    def test_declared_required_args_exist_in_properties(self):
+        for t in TOOLS:
+            schema = t['inputSchema']
+            for name in schema.get('required', []):
+                self.assertIn(name, schema['properties'],
+                              f"{t['name']} requires '{name}' but never declares it")
+
+    def test_unknown_method_is_a_protocol_error(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'nope/nope'}, self.data)
+        self.assertEqual(reply['error']['code'], -32601)
+
+    def test_unknown_tool_is_reported(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                        'params': {'name': 'health_nope', 'arguments': {}}}, self.data)
+        self.assertEqual(reply['error']['code'], -32602)
+
+    def test_missing_data_explains_itself_instead_of_crashing(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                        'params': {'name': 'health_overview', 'arguments': {}}}, self.data)
+        self.assertTrue(reply['result']['isError'])
+        self.assertIn('convert_health_data.py', reply['result']['content'][0]['text'])
+
+    def test_ping(self):
+        self.assertEqual(handle({'jsonrpc': '2.0', 'id': 9, 'method': 'ping'},
+                                self.data)['result'], {})
+
+
+class TestMcpDataLayer(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['date', 'steps', 'sleep_asleep_hours', 'wear_class'])
+            w.writerow(['2026-01-01', '5000', '7.0', 'full'])
+            w.writerow(['2026-01-02', '', '6.5', 'full'])       # blank, not zero
+            w.writerow(['2026-01-03', '9000', '', 'partial'])
+        self.data = HealthData(self.dir)
+
+    def test_blank_cells_are_absent_not_zero(self):
+        series = self.data.series('steps')
+        self.assertEqual(len(series), 2)
+        self.assertNotIn(date(2026, 1, 2), series)
+
+    def test_date_range_filter_is_inclusive(self):
+        series = self.data.series('steps', date(2026, 1, 3), date(2026, 1, 3))
+        self.assertEqual(list(series), [date(2026, 1, 3)])
+
+    def test_stats_reports_measured_days_only(self):
+        text = _metric_stats(self.data, {'metric': 'steps'})
+        self.assertIn('n: **2**', text)
+
+    def test_unknown_metric_points_at_the_discovery_tool(self):
+        text = _metric_stats(self.data, {'metric': 'not_a_metric'})
+        self.assertIn('health_list_metrics', text)
+
+    def test_bad_date_raises_a_clear_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            _metric_stats(self.data, {'metric': 'steps', 'start': 'yesterday'})
+        self.assertIn('YYYY-MM-DD', str(ctx.exception))
+
+    def test_thin_comparison_is_flagged(self):
+        text = _compare(self.data, {'metric': 'steps', 'a_start': '2026-01-01',
+                                    'a_end': '2026-01-01', 'b_start': '2026-01-03',
+                                    'b_end': '2026-01-03'})
+        self.assertIn('thin ground', text)
+
+    def test_client_config_is_valid_json_with_absolute_paths(self):
+        cfg = json.loads(client_config(self.dir))
+        server = cfg['mcpServers']['apple-health']
+        self.assertTrue(os.path.isabs(server['command']))
+        self.assertIn('--data-dir', server['args'])
+        self.assertTrue(all(os.path.isabs(a) for a in server['args'] if a != '--data-dir'))
 
 
 if __name__ == '__main__':

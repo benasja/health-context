@@ -256,9 +256,60 @@ def illness_signals(row: dict[str, Any]) -> list[str]:
 # Daily insights table
 # ---------------------------------------------------------------------------
 
+# Single-day excursions no body produces.
+#
+# resolve_max_hr() already discards an isolated 198 bpm peak as an optical-sensor
+# artifact; daily vitals need the same policy. One resting-HR reading of 92 bpm
+# sitting between neighbours of 64 and 60 is not a physiological event, but left
+# in it becomes the record maximum, a +8.4 z-score, and the highest-severity
+# strain episode in two years of data — a fabricated finding a coach would act
+# on. Values are jumps the day must clear against *both* neighbours, in the same
+# direction: a genuine step change to a new level is not a spike and survives.
+SPIKE_JUMPS = {
+    'resting_hr': 12.0,        # bpm
+    'wrist_temp_c': 1.0,       # degC
+    'respiratory_rate': 4.0,   # breaths/min
+    'hrv_sdnn': 40.0,          # ms
+    'spo2_avg': 4.0,           # percentage points
+}
+
+SPIKE_NEIGHBOUR_DAYS = 3
+
+
+def isolated_spikes(
+    daily_rows: list[dict[str, Any]],
+    start: date | None = None,
+) -> list[tuple[str, date]]:
+    """Days whose value both neighbouring measurements contradict by a wide margin.
+
+    Deliberately narrow. It fires on a lone outlier flanked by ordinary days,
+    which is the signature of a bad optical read, and stays silent on a sustained
+    shift, which is the signature of something real.
+    """
+    rows = [r for r in daily_rows if not start or date.fromisoformat(r['date']) >= start]
+    found: list[tuple[str, date]] = []
+    for column, jump in SPIKE_JUMPS.items():
+        series = build_series(rows, column)
+        days = sorted(series)
+        for i, d in enumerate(days):
+            previous = next((days[j] for j in range(i - 1, -1, -1)
+                             if (d - days[j]).days <= SPIKE_NEIGHBOUR_DAYS), None)
+            following = next((days[j] for j in range(i + 1, len(days))
+                              if (days[j] - d).days <= SPIKE_NEIGHBOUR_DAYS), None)
+            if previous is None or following is None:
+                continue
+            back = series[d] - series[previous]
+            forward = series[d] - series[following]
+            if abs(back) > jump and abs(forward) > jump and (back > 0) == (forward > 0):
+                found.append((column, d))
+    found.sort(key=lambda item: (item[1], item[0]))
+    return found
+
+
 def build_daily_insights(
     daily_rows: list[dict[str, Any]],
     start: date | None = None,
+    suspect_days: Sequence[tuple[str, date]] = (),
 ) -> list[dict[str, Any]]:
     rows = [r for r in daily_rows if not start or date.fromisoformat(r['date']) >= start]
     if not rows:
@@ -266,6 +317,10 @@ def build_daily_insights(
 
     dates = [date.fromisoformat(r['date']) for r in rows]
     series = {col: build_series(rows, col) for col in BASELINE_METRICS}
+    # Drop artifacts before anything reads them, so a bad sample cannot produce a
+    # deviation, a z-score, a strain signal, or a place in later baselines.
+    for column, day in suspect_days:
+        series.get(column, {}).pop(day, None)
     baselines = {col: rolling_baseline(series[col], dates) for col in BASELINE_METRICS}
 
     load_series = build_series(rows, 'exercise_minutes')
@@ -377,6 +432,11 @@ ASSOCIATIONS = [
 ]
 
 MIN_PAIRS = 30
+
+# |r| below this explains under ~4% of the variance. Over 600 paired days such a
+# coefficient still clears |t| > 2, so significance alone must not be allowed to
+# present it as a finding worth acting on.
+WEAK_R = 0.2
 
 
 def analyse_associations(
@@ -777,7 +837,6 @@ def render_insights_report(
 def render_llm_context(
     daily_rows: list[dict[str, Any]],
     insight_rows: list[dict[str, Any]],
-    trends: list[dict[str, Any]],
     associations: list[dict[str, Any]],
     start: date | None,
     history: HistoryResult | None = None,
@@ -813,38 +872,35 @@ def render_llm_context(
     lines.append('')
 
     lines.extend(health_history.render_situation(history))
+    lines.extend(health_history.render_events(history))
     lines.extend(health_history.render_capacity(history))
-    lines.extend(health_history.render_records(history))
+    lines.extend(health_history.render_target(history))
+    lines.extend(health_history.render_workouts(history))
     lines.extend(health_history.render_eras(history))
-    lines.extend(health_history.render_yearly(history))
-    lines.extend(health_history.render_cycles(history))
+    lines.extend(health_history.render_episodes(history))
     lines.extend(health_history.render_distributions(history))
     lines.extend(health_history.render_streaks(history))
-
-    if trends:
-        lines.append('## Direction of travel (last 30d vs prior 90d)')
-        lines.append('')
-        lines.append('Short-horizon only. Both periods sit inside the current era, so a "flat" '
-                     'reading here can still be far below the capacity table above.')
-        lines.append('')
-        for t in trends:
-            verdict = f", {t['verdict']}" if t['verdict'] else ''
-            lines.append(f"- {t['metric']}: {t['prior_mean']} -> {t['recent_mean']} {t['unit']} "
-                         f"({t['change']:+}{verdict})")
-        lines.append('')
+    lines.extend(health_history.render_records(history))
+    lines.extend(health_history.render_yearly(history))
 
     notable = [a for a in associations if a['notable']]
     if notable:
         lines.append('## Statistically notable personal associations')
         lines.append('')
         lines.append(f'Correlations over paired days (min {MIN_PAIRS} pairs, |t| > 2). '
-                     'Association, not cause.')
+                     '**Association, not cause, and every one of these is confounded**: season, '
+                     'daylight, night length, workload and the events above all move several of '
+                     'these variables at once. With this many days even a trivial relationship '
+                     f'clears the significance bar — anything under |r| {WEAK_R:.1f} explains '
+                     'less than a few percent of the variation and is not a basis for advice. Do '
+                     'not invert a correlation into an instruction (a negative steps/deep-sleep '
+                     'coefficient is not a reason to walk less).')
         lines.append('')
         for a in notable:
-            lines.append(f"- {a['label']}: r={a['r']:+} (n={a['n']}, lag {a['lag_days']}d)")
+            strength = 'weak' if abs(a['r']) < WEAK_R else 'moderate'
+            lines.append(f"- {a['label']}: r={a['r']:+} ({strength}, n={a['n']}, "
+                         f"lag {a['lag_days']}d)")
         lines.append('')
-
-    lines.extend(health_history.render_episodes(history))
 
     recent = insight_rows[-recent_days:]
     if recent:
@@ -874,11 +930,14 @@ def render_llm_context(
     lines.extend([
         '## How to use this',
         '',
-        'Anchor every judgement on the capacity table, not on the 30d-vs-90d trends: the trends '
-        'compare two points inside the same regime and will call a sustained collapse "flat". '
-        'Name the two or three changes with the largest expected effect, size them against what '
-        'this person has already proven they can hold, and say explicitly when the data cannot '
-        'answer a question. Blank or `n/a` cells mean "not measured", never zero.',
+        'Read Inferred events before the numbers, and ask about them rather than explaining them. '
+        'Anchor judgements on the capacity table and the working target, size any suggestion '
+        'against what was achieved in the last 28 days rather than against the personal record, '
+        'and check the modality table before calling any volume figure training. Name the two or '
+        'three changes with the largest expected effect, and say explicitly when the data cannot '
+        'answer a question. `n/a` means "not measured", never zero. A short-horizon 30d-vs-90d '
+        'trend table was deliberately left out of this pack: both of its periods sit inside the '
+        'current stretch, so it reports a sustained collapse as roughly flat.',
     ])
     return '\n'.join(lines) + '\n'
 
@@ -888,8 +947,11 @@ def write_insight_outputs(
     daily_rows: list[dict[str, Any]],
     coverage: list[dict[str, Any]],
     start: date | None,
+    workout_rows: Sequence[dict[str, Any]] = (),
+    max_hr: float | None = None,
 ) -> dict[str, str]:
-    insight_rows = build_daily_insights(daily_rows, start)
+    suspect_days = isolated_spikes(daily_rows, start)
+    insight_rows = build_daily_insights(daily_rows, start, suspect_days)
     trends, withheld_trends = compute_trends(daily_rows, start)
     associations = analyse_associations(daily_rows, start)
     contrasts = [
@@ -898,7 +960,8 @@ def write_insight_outputs(
             for driver, outcome, threshold, lag in CONTRASTS
         ) if c
     ]
-    history = health_history.build_history(daily_rows, insight_rows, start)
+    history = health_history.build_history(
+        daily_rows, insight_rows, start, workout_rows, max_hr, suspect_days)
     thin_metrics = thinly_covered_metrics(coverage)
 
     paths = {
@@ -917,7 +980,7 @@ def write_insight_outputs(
                                        contrasts, start, coverage, withheld_trends, history))
 
     with open(paths['llm_context'], 'w', encoding='utf-8') as f:
-        f.write(render_llm_context(daily_rows, insight_rows, trends, associations, start,
+        f.write(render_llm_context(daily_rows, insight_rows, associations, start,
                                    history, thin_metrics))
 
     return paths

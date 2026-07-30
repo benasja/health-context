@@ -32,22 +32,34 @@ from health_coaching import (
 from health_history import (
     METRICS_BY_COLUMN,
     StreakRule,
+    WorkoutSession,
+    band_edge_distance,
     build_history,
     build_metric_series,
     compute_capacity,
+    compute_distribution,
     compute_records,
     compute_streak,
+    detect_events,
+    episodes_by_severity,
     group_strain_episodes,
+    modality_breakdown,
+    month_by_year_grid,
     percentile,
+    progression_target,
     segment_eras,
     signal_kind,
+    workout_blackouts,
+    zone_totals,
 )
 from health_insights import (
+    build_daily_insights,
     build_series,
     carry_forward,
     circular_stats,
     compute_trends,
     illness_signals,
+    isolated_spikes,
     pearson,
     render_llm_context,
     rolling_baseline,
@@ -600,14 +612,43 @@ def day_list(n, start=HISTORY_START):
 
 
 class TestHistorySeries(unittest.TestCase):
-    def test_blank_day_is_zero_for_a_cumulative_metric(self):
-        # No AppleExerciseTime samples on a day that was otherwise recorded
-        # really is zero exercise; dropping it would let months of inactivity
-        # masquerade as months of missing data.
+    def test_a_blank_cumulative_day_is_never_imputed_as_zero(self):
+        # An earlier version zero-filled these, which put 150 fabricated winter
+        # zeros into the daylight series and understated January by 3.4x.
+        # HealthKit cannot distinguish "nothing happened" from "nothing was
+        # recorded", so neither may this.
         rows = hist_rows(exercise_minutes=[30, None, 10])
         by_date = {date.fromisoformat(r['date']): r for r in rows}
         series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], day_list(3))
+        self.assertNotIn(HISTORY_START + timedelta(days=1), series)
+        self.assertEqual(len(series), 2)
+
+    def test_a_measured_zero_survives(self):
+        # The flip side: an explicit 0 is data and must not be dropped.
+        rows = hist_rows(exercise_minutes=[30, 0, 10])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], day_list(3))
         self.assertEqual(series[HISTORY_START + timedelta(days=1)], 0.0)
+
+    def test_a_suspect_day_is_dropped_from_its_own_column_only(self):
+        rows = hist_rows(resting_hr=[60, 92, 61], hrv_sdnn=[50, 51, 52])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        spike = HISTORY_START + timedelta(days=1)
+        rhr = build_metric_series(by_date, METRICS_BY_COLUMN['resting_hr'],
+                                  day_list(3), [('resting_hr', spike)])
+        hrv = build_metric_series(by_date, METRICS_BY_COLUMN['hrv_sdnn'],
+                                  day_list(3), [('resting_hr', spike)])
+        self.assertNotIn(spike, rhr)
+        self.assertIn(spike, hrv)
+
+    def test_distribution_counts_missing_days_and_floors_on_measured_values(self):
+        rows = hist_rows(exercise_minutes=[30, None, 10])
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        metric = METRICS_BY_COLUMN['exercise_minutes']
+        dist = compute_distribution(build_metric_series(by_date, metric, day_list(3)), metric, 3)
+        self.assertEqual(dist.n_days, 2)
+        self.assertEqual(dist.days_missing, 1)
+        self.assertEqual(dist.lowest, 10.0)   # not 0.0
 
     def test_blank_day_stays_missing_for_a_reading(self):
         rows = hist_rows(hrv_sdnn=[50, None, 60])
@@ -649,12 +690,21 @@ class TestPersonalRecords(unittest.TestCase):
         self.assertAlmostEqual(records['7d'].total, 420.0)
         self.assertEqual(records['7d'].period, '2025-01-11..2025-01-17')
 
-    def test_a_truncated_calendar_month_cannot_hold_a_record(self):
-        # Two days of January must not out-rank nothing else; with fewer than
-        # MIN_MONTH_DAYS in the window there is no month record at all.
-        records = self._records('exercise_minutes', [200, 200])
-        self.assertNotIn('month', records)
-        self.assertNotIn('week', records)
+    def test_calendar_scopes_are_gone(self):
+        # ISO week and calendar month were dropped: a best ISO week is a best
+        # rolling 7 days snapped to an arbitrary grid, and it reported the same
+        # week one day offset for a fifth of the pack's tokens.
+        records = self._records('exercise_minutes', [40] * 60)
+        self.assertEqual(set(records), {'day', '7d', '28d'})
+
+    def test_a_record_window_reports_how_many_of_its_days_were_measured(self):
+        # The first window holds only five measured days but the same mean, and
+        # ties go to the earliest — so the record must disclose 5/7 rather than
+        # let a partly-measured window pass as a full one.
+        records = self._records('exercise_minutes', [None, None] + [60] * 30)
+        self.assertEqual(records['7d'].observations, 5)
+        self.assertEqual(records['7d'].span, 7)
+        self.assertAlmostEqual(records['7d'].per_day, 60.0)
 
     def test_thin_coverage_blocks_a_window_record(self):
         # Two measured nights inside a week is not a week of sleep.
@@ -686,12 +736,20 @@ class TestCapacityGap(unittest.TestCase):
         self.assertEqual(cap.best_period, '2025-01-01..2025-01-28')
         self.assertAlmostEqual(cap.pct_of_peak, 10.0)
 
-    def test_percent_of_peak_inverts_when_lower_is_better(self):
-        # 50 bpm then 60 bpm: the current period is worse, so it must read
-        # below 100%, not above it.
+    def test_percent_of_peak_is_withheld_where_zero_is_unreachable(self):
+        # A resting-HR ratio is trapped near 100% by construction: at the worst
+        # 28 days of the record it would still read "93% of peak" and be taken
+        # as fine. The percentile carries that information honestly instead.
         cap = self._capacity('resting_hr', [50] * 28 + [60] * 28)
         self.assertAlmostEqual(cap.best, 50.0)
-        self.assertAlmostEqual(cap.pct_of_peak, 100.0 * 50 / 60)
+        self.assertFalse(cap.zero_floored)
+        self.assertIsNone(cap.pct_of_peak)
+        self.assertIsNotNone(cap.percentile)
+
+    def test_percent_of_peak_is_kept_for_zero_floored_metrics(self):
+        cap = self._capacity('exercise_minutes', [100] * 28 + [10] * 28)
+        self.assertTrue(cap.zero_floored)
+        self.assertAlmostEqual(cap.pct_of_peak, 10.0)
 
     def test_a_record_shorter_than_the_window_still_reports_current(self):
         cap = self._capacity('exercise_minutes', [20, 40])
@@ -842,6 +900,198 @@ class TestStrainEpisodes(unittest.TestCase):
         self.assertEqual(signal_kind('resting HR +3.0 bpm'), 'resting HR')
 
 
+def session(day_offset, activity, minutes=30.0, zones=None):
+    return WorkoutSession(day=HISTORY_START + timedelta(days=day_offset),
+                          activity=activity, minutes=minutes, zones=zones or {})
+
+
+class TestWorkoutModality(unittest.TestCase):
+    def test_share_is_by_minutes_not_by_session_count(self):
+        # One long rehab walk and one short interval session are one session
+        # each and are not the same training.
+        sessions = [session(0, 'Cooldown', 90.0), session(1, 'HIIT', 10.0)]
+        shares = modality_breakdown(sessions)
+        self.assertEqual(shares[0].activity, 'Cooldown')
+        self.assertAlmostEqual(shares[0].share_pct, 90.0)
+
+    def test_breakdown_can_be_scoped_to_a_period(self):
+        sessions = [session(0, 'Strength', 60.0), session(40, 'Cooldown', 60.0)]
+        shares = modality_breakdown(sessions, HISTORY_START + timedelta(days=30),
+                                    HISTORY_START + timedelta(days=50))
+        self.assertEqual([s.activity for s in shares], ['Cooldown'])
+
+    def test_zone_totals_sum_only_the_requested_window(self):
+        sessions = [session(0, 'Ride', 60.0, {'z2': 40.0, 'z4': 20.0}),
+                    session(40, 'Ride', 60.0, {'z2': 10.0})]
+        self.assertAlmostEqual(zone_totals(sessions)['z2'], 50.0)
+        self.assertAlmostEqual(
+            zone_totals(sessions, HISTORY_START, HISTORY_START + timedelta(days=10))['z2'], 40.0)
+
+    def test_empty_workout_list_is_not_a_division_by_zero(self):
+        self.assertEqual(modality_breakdown([]), [])
+        self.assertEqual(zone_totals([]), dict.fromkeys(('z1', 'z2', 'z3', 'z4', 'z5'), 0.0))
+
+
+class TestWorkoutBlackouts(unittest.TestCase):
+    def test_a_long_gap_between_workouts_is_reported(self):
+        sessions = [session(0, 'Strength'), session(40, 'Strength')]
+        gaps = workout_blackouts(sessions, day_list(41))
+        self.assertEqual(gaps[0][2], 39)
+        self.assertEqual(gaps[0][0], HISTORY_START + timedelta(days=1))
+
+    def test_short_gaps_are_ignored(self):
+        sessions = [session(i, 'Strength') for i in range(0, 20, 3)]
+        self.assertEqual(workout_blackouts(sessions, day_list(20)), [])
+
+    def test_a_trailing_gap_still_counts(self):
+        sessions = [session(0, 'Strength')]
+        gaps = workout_blackouts(sessions, day_list(30))
+        self.assertEqual(gaps[0][2], 29)
+
+
+class TestInferredEvents(unittest.TestCase):
+    def test_a_modality_that_stops_dead_is_surfaced(self):
+        sessions = [session(i, 'Strength') for i in range(0, 60, 2)]
+        events = detect_events(sessions, day_list(400))
+        stops = [e for e in events if 'stops' in e.headline]
+        self.assertEqual(len(stops), 1)
+        self.assertIn('Strength', stops[0].headline)
+
+    def test_a_modality_that_appears_from_nothing_is_surfaced(self):
+        sessions = ([session(i, 'Strength') for i in range(0, 60, 2)]
+                    + [session(i, 'Cooldown') for i in range(200, 260)])
+        events = detect_events(sessions, day_list(300))
+        arrivals = [e for e in events if 'appears' in e.headline]
+        self.assertEqual(len(arrivals), 1)
+        self.assertIn('Cooldown', arrivals[0].headline)
+
+    def test_a_modality_present_from_the_start_is_not_called_new(self):
+        sessions = [session(i, 'Walking') for i in range(0, 300, 2)]
+        events = detect_events(sessions, day_list(300))
+        self.assertEqual([e for e in events if 'appears' in e.headline], [])
+
+    def test_events_never_name_a_cause(self):
+        # The single most harmful inference available in this data.
+        sessions = ([session(i, 'Strength') for i in range(0, 60, 2)]
+                    + [session(i, 'Cooldown') for i in range(200, 260)])
+        text = ' '.join(e.headline + ' '.join(e.evidence)
+                        for e in detect_events(sessions, day_list(300))).lower()
+        for word in ('injur', 'surgery', 'operation', 'illness', 'lazy', 'motivat'):
+            self.assertNotIn(word, text)
+
+    def test_events_are_ordered_by_date(self):
+        sessions = ([session(i, 'Strength') for i in range(0, 60, 2)]
+                    + [session(i, 'Cooldown') for i in range(200, 260)])
+        events = detect_events(sessions, day_list(300))
+        self.assertEqual([e.when for e in events], sorted(e.when for e in events))
+
+    def test_no_workouts_means_no_events(self):
+        self.assertEqual(detect_events([], day_list(300)), [])
+
+
+class TestEpisodeSeverity(unittest.TestCase):
+    def test_the_worst_episode_sorts_first_regardless_of_date(self):
+        rows = ([{'date': '2025-01-01', 'strain_flag': 'yes', 'strain_signal_count': 2,
+                  'strain_detail': 'HRV -1.0 SD'}]
+                + [{'date': f'2025-06-{d:02d}', 'strain_flag': 'yes', 'strain_signal_count': 3,
+                    'strain_detail': 'HRV -1.0 SD; resting HR +4.0 bpm'} for d in range(1, 8)])
+        ranked = episodes_by_severity(group_strain_episodes(rows))
+        self.assertEqual(ranked[0].flagged_days, 7)
+        self.assertEqual(ranked[0].start, date(2025, 6, 1))
+
+
+class TestSensorArtifacts(unittest.TestCase):
+    def test_a_lone_implausible_spike_is_caught(self):
+        rows = hist_rows(resting_hr=[64, 64, 92, 60, 61])
+        found = isolated_spikes(rows)
+        self.assertEqual(found, [('resting_hr', HISTORY_START + timedelta(days=2))])
+
+    def test_a_sustained_step_change_is_not_an_artifact(self):
+        # A real shift to a new level must survive; only a value both
+        # neighbours contradict is a spike.
+        rows = hist_rows(resting_hr=[55, 55, 55, 75, 76, 75, 76])
+        self.assertEqual(isolated_spikes(rows), [])
+
+    def test_an_edge_day_without_two_neighbours_is_left_alone(self):
+        rows = hist_rows(resting_hr=[92, 60, 61])
+        self.assertEqual(isolated_spikes(rows), [])
+
+    def test_a_moderate_excursion_is_left_alone(self):
+        rows = hist_rows(resting_hr=[60, 68, 61])
+        self.assertEqual(isolated_spikes(rows), [])
+
+    def test_a_flagged_artifact_cannot_raise_a_strain_signal(self):
+        rows = hist_rows(resting_hr=[64] * 30 + [92] + [64] * 5,
+                         hrv_sdnn=[50] * 36)
+        suspect = isolated_spikes(rows)
+        self.assertTrue(suspect)
+        insights = build_daily_insights(rows, None, suspect)
+        spike_row = next(r for r in insights if r['date'] == suspect[0][1].isoformat())
+        self.assertEqual(spike_row['resting_hr_z'], '')
+        self.assertEqual(spike_row['strain_flag'], '')
+
+
+class TestProgressionTarget(unittest.TestCase):
+    def _target(self, values):
+        rows = hist_rows(exercise_minutes=values)
+        history = build_history(rows, [])
+        return progression_target(history.capacity)
+
+    def test_target_is_anchored_on_recent_volume_not_on_the_record(self):
+        target = self._target([100] * 28 + [10] * 28)
+        self.assertAlmostEqual(target.recent_weekly, 70.0)
+        self.assertAlmostEqual(target.next_week, 77.0)
+        self.assertAlmostEqual(target.ceiling_weekly, 700.0)
+        self.assertLess(target.next_week, target.ceiling_weekly / 5)
+
+    def test_weeks_to_ceiling_is_reported_when_below_it(self):
+        target = self._target([100] * 28 + [10] * 28)
+        self.assertGreater(target.weeks_to_ceiling, 10)
+
+    def test_no_ceiling_climb_when_already_at_the_best(self):
+        target = self._target([50] * 40)
+        self.assertIsNone(target.weeks_to_ceiling)
+
+    def test_no_load_metric_means_no_target(self):
+        self.assertIsNone(progression_target([]))
+
+
+class TestMonthByYearGrid(unittest.TestCase):
+    def test_the_same_month_in_two_years_stays_two_cells(self):
+        # Pooling months across years turns a decline into a fake season.
+        series = {}
+        for year, value in ((2025, 60.0), (2026, 10.0)):
+            for day in range(1, 29):
+                series[date(year, 3, day)] = value
+        days = sorted(series)
+        years, grid = month_by_year_grid(series, days)
+        self.assertEqual(years, [2025, 2026])
+        cells = dict(grid)['Mar']
+        self.assertAlmostEqual(cells[2025][0], 60.0)
+        self.assertAlmostEqual(cells[2026][0], 10.0)
+
+    def test_a_month_with_no_data_in_a_year_is_empty_not_zero(self):
+        series = {date(2025, 3, d): 60.0 for d in range(1, 29)}
+        days = sorted(series) + [date(2026, 3, 1)]
+        _years, grid = month_by_year_grid(series, days)
+        self.assertIsNone(dict(grid)['Mar'][2026])
+
+
+class TestBandEdges(unittest.TestCase):
+    def test_distance_to_the_nearest_band_edge(self):
+        self.assertAlmostEqual(band_edge_distance(10.03), 0.03)
+        self.assertAlmostEqual(band_edge_distance(45.0), 15.0)
+
+    def test_boundary_margin_is_reported_for_every_boundary_but_the_first(self):
+        rows = hist_rows(exercise_minutes=[80] * 60 + [0] * 60)
+        by_date = {date.fromisoformat(r['date']): r for r in rows}
+        days = day_list(120)
+        series = build_metric_series(by_date, METRICS_BY_COLUMN['exercise_minutes'], days)
+        eras = segment_eras(series, days, {})
+        self.assertIsNone(eras[0].boundary_margin)
+        self.assertIsNotNone(eras[1].boundary_margin)
+
+
 class TestPercentiles(unittest.TestCase):
     def test_median_of_an_even_sample(self):
         self.assertAlmostEqual(percentile([1, 2, 3, 4], 50), 2.5)
@@ -887,15 +1137,46 @@ class TestHistoryAssembly(unittest.TestCase):
         self.assertEqual(history.first_day, HISTORY_START + timedelta(days=5))
         self.assertEqual(history.n_days, 5)
 
-    def test_llm_context_leads_with_the_capacity_gap(self):
+    def test_llm_context_puts_events_and_capacity_above_records(self):
         rows = hist_rows(exercise_minutes=[90] * 40 + [5] * 40,
                          steps=[12000] * 40 + [4000] * 40)
-        history = build_history(rows, [], None)
-        text = render_llm_context(rows, [], [], [], HISTORY_START, history)
+        workouts = [{'date': (HISTORY_START + timedelta(days=i)).isoformat(),
+                     'activity_type': 'Strength', 'duration_min': '45'} for i in range(0, 40, 2)]
+        history = build_history(rows, [], None, workouts, max_hr=180.0)
+        text = render_llm_context(rows, [], [], HISTORY_START, history)
         self.assertIn('## Capacity gap', text)
         self.assertLess(text.index('## Capacity gap'), text.index('## Personal records'))
         self.assertIn('What this data cannot tell you', text)
         self.assertNotIn('None', text)
+
+    def test_llm_context_carries_no_trend_table(self):
+        # Its two periods sit inside the same stretch, so it reports a
+        # sustained collapse as roughly flat. Paying tokens for a section the
+        # same file then tells the reader to ignore is worse than omitting it.
+        rows = hist_rows(exercise_minutes=[90] * 40 + [5] * 40)
+        text = render_llm_context(rows, [], [], HISTORY_START, build_history(rows, [], None))
+        self.assertNotIn('Direction of travel', text)
+
+    def test_llm_context_never_attributes_load_to_motivation(self):
+        rows = hist_rows(exercise_minutes=[90] * 40 + [5] * 40)
+        history = build_history(rows, [], None)
+        text = render_llm_context(rows, [], [], HISTORY_START, history).lower()
+        # The word may appear only where the file forbids the inference.
+        for sentence in text.split('.'):
+            if 'motivation' in sentence:
+                self.assertTrue('not' in sentence or 'do not' in sentence,
+                                f'unguarded motivation claim: {sentence.strip()}')
+
+    def test_workout_modality_reaches_the_pack(self):
+        rows = hist_rows(exercise_minutes=[40] * 40)
+        workouts = [{'date': (HISTORY_START + timedelta(days=i)).isoformat(),
+                     'activity_type': 'Cooldown', 'duration_min': '40',
+                     'hr_zone_z1_min': '35'} for i in range(40)]
+        history = build_history(rows, [], None, workouts, max_hr=181.0)
+        text = render_llm_context(rows, [], [], HISTORY_START, history)
+        self.assertIn('Cooldown', text)
+        self.assertIn('181 bpm', text)
+        self.assertIn('| z1 |', text)
 
 
 class TestRegistryIntegrity(unittest.TestCase):

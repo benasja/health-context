@@ -224,7 +224,8 @@ def main() -> None:
 
     print('Building insights...')
     insight_paths = write_insight_outputs(
-        out_dir, result.daily_rows, result.coverage, result.analysis_start)
+        out_dir, result.daily_rows, result.coverage, result.analysis_start,
+        result.workout_rows, result.max_hr)
 
     print()
     print('=' * 60)

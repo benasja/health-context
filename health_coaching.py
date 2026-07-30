@@ -1615,6 +1615,9 @@ ANALYSIS_ANCHORS = ('resting_hr', 'hrv_sdnn', 'sleep_asleep_hours')
 class CoachingResult:
     paths: dict[str, str]
     daily_rows: list[dict[str, Any]]
+    # Workouts carry the one thing daily totals cannot: what the minutes were.
+    # The insights layer needs them to tell training from rehabilitation.
+    workout_rows: list[dict[str, Any]]
     coverage: list[dict[str, Any]]
     analysis_start: date | None
     max_hr: float
@@ -1679,6 +1682,7 @@ def write_coaching_outputs(
     return CoachingResult(
         paths=paths,
         daily_rows=daily_rows,
+        workout_rows=workout_rows,
         coverage=coverage,
         analysis_start=start,
         max_hr=max_hr,

@@ -21,12 +21,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from health_metrics import (
     ALL_PARSED_TYPES,
-    CARRY_FORWARD,
     COLUMN_META,
     DAILY_SPECS,
     EFFORT_TYPE,
     MINDFUL_TYPE,
-    REGISTRY_COLUMNS,
     SLEEP_TYPE,
     SPARSE_BY_DESIGN,
     SPECS_BY_TYPE,
@@ -363,15 +361,6 @@ def duration_to_minutes(amount: Optional[float], unit: str) -> Optional[float]:
         return amount / 60.0
     if u in ('h', 'hr', 'hour', 'hours'):
         return amount * 60.0
-    return amount
-
-
-def body_mass_to_kg(amount: Optional[float], unit: str) -> Optional[float]:
-    if amount is None:
-        return None
-    u = (unit or 'kg').lower()
-    if u in ('lb', 'lbs', 'pound', 'pounds'):
-        return amount * 0.45359237
     return amount
 
 
@@ -796,24 +785,67 @@ def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True)
 # Sleep
 # ---------------------------------------------------------------------------
 
-def assign_sleep_to_day(start: datetime, end: datetime) -> date:
-    """Attribute a sleep segment to the wake calendar day (end date)."""
-    return local_calendar_date(end)
-
-
 def _hours(start: datetime, end: datetime) -> float:
     return max((end - start).total_seconds(), 0) / 3600.0
+
+
+# Longest break in recorded sleep that still counts as the same night. Brief
+# awakenings are logged as Awake segments and bridge the gap, so this only needs
+# to be long enough to tolerate a stretch the watch failed to record at all.
+SLEEP_SESSION_GAP_MINUTES = 90.0
+
+
+def _cluster_sleep_sessions(
+    segments: List[Tuple[datetime, datetime, str]],
+) -> List[List[Tuple[datetime, datetime, str]]]:
+    """Split one source's segments into distinct sleep sessions.
+
+    Bucketing raw segments by calendar date does not work: a stretch of sleep
+    beginning 23:52 and ending 23:55 shares a date with the *previous* night, so
+    a single day's bucket ends up holding the tail of one night and the start of
+    the next. That produces a ~24 hour sleep window, a meaningless midpoint and
+    a doubled duration. Grouping by continuity first, then dating each session by
+    when it ended, keeps every night intact.
+    """
+    sessions: List[List[Tuple[datetime, datetime, str]]] = []
+    current: List[Tuple[datetime, datetime, str]] = []
+    current_end: Optional[datetime] = None
+
+    for seg in sorted(segments, key=lambda x: x[0]):
+        start, end, _label = seg
+        if current_end is not None:
+            gap = (start - current_end).total_seconds() / 60.0
+            if gap > SLEEP_SESSION_GAP_MINUTES:
+                sessions.append(current)
+                current = []
+                current_end = None
+        current.append(seg)
+        if current_end is None or end > current_end:
+            current_end = end
+
+    if current:
+        sessions.append(current)
+    return sessions
 
 
 def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, Any]]:
     """Per-night sleep totals, stages, timing and efficiency.
 
-    Multiple apps often log the same night (a sleep tracker plus the watch plus
-    the phone's in-bed guess). Summing them double-counts, so one authoritative
-    source is chosen per night: the one that reports real stages wins, and among
-    equals the one with the most recorded sleep wins.
+    Segments are first grouped per source into continuous sessions, then each
+    session is attributed to the day it ended on (the wake day). Where several
+    sources logged the same night — a sleep tracker, the watch, and the phone's
+    in-bed guess — one is chosen rather than summed: staged data (REM/Core/Deep)
+    wins, and among equals the one recording the most sleep wins.
+
+    Only the main session of each day is reported, so a daytime nap never
+    overwrites the night's timing.
+
+    Deep + core + REM will not always equal the reported total: older watch
+    firmware and third-party trackers log AsleepUnspecified, which counts as
+    sleep but carries no stage. That remainder is surfaced separately as
+    sleep_unspecified_hours rather than quietly breaking the arithmetic.
     """
-    by_day_source: Dict[Tuple[date, str], List[Tuple[datetime, datetime, str]]] = defaultdict(list)
+    by_source: Dict[str, List[Tuple[datetime, datetime, str]]] = defaultdict(list)
     seen: Set[Tuple] = set()
 
     for rec in records:
@@ -827,21 +859,22 @@ def aggregate_sleep_by_day(records: List[HealthRecord]) -> Dict[date, Dict[str, 
         if key in seen:
             continue
         seen.add(key)
-        day = assign_sleep_to_day(rec.start, rec.end)
-        by_day_source[(day, source)].append((rec.start, rec.end, label))
+        by_source[source].append((rec.start, rec.end, label))
 
-    candidates: Dict[date, List[Tuple[float, bool, str, List]]] = defaultdict(list)
-    for (day, source), segments in by_day_source.items():
-        asleep = sum(_hours(s, e) for s, e, lbl in segments if lbl in ASLEEP_STAGES)
-        staged = any(lbl in STAGED_VALUES for _s, _e, lbl in segments)
-        candidates[day].append((asleep, staged, source, segments))
+    candidates: Dict[date, List[Tuple[bool, float, str, List]]] = defaultdict(list)
+    for source, segments in by_source.items():
+        for session in _cluster_sleep_sessions(segments):
+            asleep = sum(_hours(s, e) for s, e, lbl in session if lbl in ASLEEP_STAGES)
+            if asleep <= 0:
+                continue  # in-bed-only or awake-only, nothing to report
+            staged = any(lbl in STAGED_VALUES for _s, _e, lbl in session)
+            wake_day = local_calendar_date(max(e for _s, e, _l in session))
+            candidates[wake_day].append((staged, asleep, source, session))
 
     result: Dict[date, Dict[str, Any]] = {}
     for day, options in candidates.items():
-        # staged sources first, then most sleep recorded
-        best = max(options, key=lambda o: (o[1], o[0]))
-        _asleep, _staged, source, segments = best
-        result[day] = _summarize_night(segments, source)
+        staged, _asleep, source, session = max(options, key=lambda o: (o[0], o[1]))
+        result[day] = _summarize_night(session, source)
     return result
 
 
@@ -879,6 +912,7 @@ def _summarize_night(segments: List[Tuple[datetime, datetime, str]], source: str
         'core': totals['core'],
         'deep': totals['deep'],
         'awake': totals['awake'],
+        'unspecified': totals['unspecified'],
         'awakenings': awake_count,
     }
 
@@ -965,6 +999,7 @@ def build_daily_metrics(data: ExportData) -> Tuple[List[Dict[str, Any]], Set[str
         row['sleep_rem_hours'] = round(night['rem'], 3) if night.get('rem') else ''
         row['sleep_core_hours'] = round(night['core'], 3) if night.get('core') else ''
         row['sleep_deep_hours'] = round(night['deep'], 3) if night.get('deep') else ''
+        row['sleep_unspecified_hours'] = round(night['unspecified'], 3) if night.get('unspecified') else ''
         row['sleep_awake_hours'] = round(night['awake'], 3) if night.get('awake') else ''
         row['sleep_efficiency_pct'] = round(night['efficiency'], 1) if night.get('efficiency') else ''
         row['sleep_awakenings'] = night.get('awakenings', '') or ''

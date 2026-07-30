@@ -11,7 +11,7 @@ percent-valued metric carries scale=100.0 to land in human-readable percent.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 # Aggregations supported by DailyAccumulator.
 #   sum      — add every sample in the day (counts, energy, distance, minutes)
@@ -184,6 +184,7 @@ DERIVED_DAILY_COLUMNS: List[Tuple[str, str, str]] = [
     ('sleep_rem_hours', 'sleep', 'REM sleep (hours)'),
     ('sleep_core_hours', 'sleep', 'Core/light sleep (hours)'),
     ('sleep_deep_hours', 'sleep', 'Deep sleep (hours)'),
+    ('sleep_unspecified_hours', 'sleep', 'Sleep the device did not stage (hours)'),
     ('sleep_awake_hours', 'sleep', 'Awake during sleep window (hours)'),
     ('sleep_efficiency_pct', 'sleep', 'Asleep / in-bed (%)'),
     ('sleep_awakenings', 'sleep', 'Number of awake segments'),
@@ -236,8 +237,6 @@ ALL_PARSED_TYPES: Set[str] = REGISTRY_TYPES | SPECIAL_TYPES | WINDOW_JOIN_TYPES 
 SPECS_BY_TYPE: Dict[str, List[MetricSpec]] = {}
 for _spec in DAILY_SPECS:
     SPECS_BY_TYPE.setdefault(_spec.hk_type, []).append(_spec)
-
-REGISTRY_COLUMNS: List[str] = [spec.column for spec in DAILY_SPECS]
 
 COLUMN_META: Dict[str, Tuple[str, str]] = {
     spec.column: (spec.group, spec.label or spec.column) for spec in DAILY_SPECS

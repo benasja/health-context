@@ -1722,5 +1722,28 @@ class TestProfile(unittest.TestCase):
                         text.index('## What this data cannot tell you'))
 
 
+class TestPackagingMetadata(unittest.TestCase):
+    """The MCP server announces its own version; nothing kept it honest."""
+
+    def test_mcp_server_version_matches_pyproject(self):
+        import re
+
+        import health_mcp
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, 'pyproject.toml'), encoding='utf-8') as handle:
+            pyproject = handle.read()
+        match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+        self.assertIsNotNone(match, 'pyproject.toml has no version')
+
+        # These drifted apart once already: the server reported 2.0.0 over the
+        # wire while the package shipped 2.1.0, leaving a client no way to tell
+        # which build it was talking to.
+        self.assertEqual(
+            health_mcp.SERVER_VERSION, match.group(1),
+            'health_mcp.SERVER_VERSION must match the version in pyproject.toml',
+        )
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

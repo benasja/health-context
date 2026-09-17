@@ -13,6 +13,64 @@ Point it at a local model and your health data never leaves the laptop at all.
 
 Python 3.10+. **No dependencies** — standard library only.
 
+## See it before you export anything
+
+You do not need your own data to judge whether this is worth your time. There is
+a generator for a synthetic two-and-a-half-year export — seasons, a training
+block, two illnesses, a holiday where the watch stayed at home:
+
+```bash
+python3 fixtures/make_demo_export.py --out-dir demo
+python3 convert_health_data.py --data-dir demo --out-dir demo
+```
+
+Four seconds later, `demo/llm_context.md` opens like this:
+
+```
+| metric                          | current | n     | pctile | best 28d | when                   |
+|---------------------------------|---------|-------|--------|----------|------------------------|
+| Steps (steps/day)               | 10,106  | 28/28 | 64%    | 12,702   | 2025-05-18..2025-06-14 |
+| Active energy (kcal/day)        | 498     | 28/28 | 31%    | 1,021    | 2025-05-21..2025-06-17 |
+| Sleep (h/night)                 | 7.26    | 28/28 | 19%    | 7.75     | 2024-11-10..2024-12-07 |
+| HRV (SDNN) (ms)                 | 50.2    | 28/28 | 79%    | 54.5     | 2025-05-23..2025-06-19 |
+| Resting HR (bpm) (lower better) | 52.4    | 28/28 | 93%    | 50.6     | 2025-05-19..2025-06-15 |
+| VO2 max (ml/kg/min)             | 44.7    | 6/28  | 52%    | 48.3     | 2025-05-10..2025-06-06 |
+```
+
+`50.2 ms` of HRV is not something anyone can act on. `50.2 ms, the 79th
+percentile of your own 934 rolling 28-day windows, against a personal best of
+54.5 in June 2025` is. That difference is the whole project.
+
+### Why that context is not a nicety
+
+The same run reports this, unprompted:
+
+```
+- 2024-11-18 — Largest physiological strain episode of the record: 7 flagged days in 7
+  - 4.1x the mean flagged-day count of the other 17 episodes
+  - signals: wrist temp, resting HR, HRV, respiratory rate, SpO2
+```
+
+Now look at where that same week ranks on sleep:
+
+```
+| Sleep (h/night) | best 7 days | 8.58 | 2024-11-18..2024-11-24 |
+```
+
+The best week of sleep in two and a half years is the week the subject had
+influenza. Hand an assistant raw rows and it will congratulate them on it. Five
+vital signs moved together that week, and only something computing against a
+personal baseline can tell the difference between resting and recovering.
+
+Nothing is hardcoded to the fixture. The strain detector found that week on its
+own, and the analysis window, the max heart rate and every baseline were inferred
+from the export.
+
+The demo data is fabricated — shaped to be plausible, not to be anyone's real
+physiology, and no number in it is a reference range. No health data is committed
+to this repository: the export is generated on demand, and CI fails if one ever
+lands in git history.
+
 ## Quick start
 
 1. Health app → profile picture → **Export All Health Data**. AirDrop or copy

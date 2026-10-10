@@ -288,7 +288,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 
 Rather than pasting `llm_context.md` into a chat, let the assistant query your
 data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
-server exposing 12 tools over stdio — still zero dependencies, still entirely
+server exposing 13 tools over stdio — still zero dependencies, still entirely
 local, nothing uploaded anywhere.
 
 ```
@@ -344,7 +344,36 @@ Restart the client afterwards.
 | `health_strain_episodes` | Multi-signal physiological flags, grouped |
 | `health_weekly` | Week-by-week rollup |
 | `health_context_pack` | The whole briefing |
+| `health_profile` | Your goals and constraints, if you wrote any down |
 | `health_data_quality` | Wear rates, coverage, excluded artifacts |
+
+### What one of them actually returns
+
+The tools that make this different from a metrics viewer are the ones that
+decide what is worth your attention. `health_strain_episodes`, run against the
+synthetic demo export above:
+
+```
+## Physiological strain episodes (most severe first)
+
+18 episode(s) across the record; flagged days within 2 clear days of each other
+are one episode. A flagged day is one where two or more of wrist temperature,
+resting HR, HRV, respiratory rate and SpO2 moved the wrong way against the
+personal 60-day baseline together. Sorted by flagged days rather than by date,
+because one of these is usually far more consequential than the rest and date
+order hides it.
+
+| episode                | span days | flagged days | peak signals | signals                                             |
+|------------------------|-----------|--------------|--------------|-----------------------------------------------------|
+| 2024-11-18..2024-11-24 | 7         | 7            | 5            | wrist temp, resting HR, HRV, respiratory rate, SpO2 |
+| 2026-02-10..2026-02-15 | 6         | 6            | 3            | wrist temp, HRV, respiratory rate, resting HR, SpO2 |
+| 2025-11-12..2025-11-16 | 5         | 3            | 2            | HRV, SpO2, resting HR                               |
+```
+
+Nothing there is a diagnosis, and the tool does not offer one — it says which
+days are unusual *for you* and which signals agreed, and leaves the conclusion
+to you. The threshold is your own 60-day baseline, so it means something
+different for every person who runs it.
 
 The server reads the generated CSVs, never `export.xml` — parsing a gigabyte of
 XML takes ~40 seconds, which no client will wait for on every call. It reports

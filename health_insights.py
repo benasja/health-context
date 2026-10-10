@@ -39,6 +39,17 @@ WORSE_WHEN_HIGH = {'resting_hr', 'respiratory_rate', 'wrist_temp_c', 'breathing_
 
 SLEEP_TARGET_HOURS = 7.5
 
+# Absolute floors under the two sleep components of the recovery score. Every
+# other component is purely baseline-relative, which is the right treatment for
+# HRV or resting HR: there is no number a night "should" hit, only your own.
+# Sleep is the exception, because a rolling baseline records a habit and a habit
+# of five hours is not recovery however settled it is. Full credit is the
+# absolute target; below it the component is capped, so a stable bad habit can
+# never read as "at baseline".
+SLEEP_DURATION_PENALTY_PER_HOUR = 20.0   # 7.5h -> 100, 6h -> 70, 5h -> 50
+SLEEP_EFFICIENCY_FULL_CREDIT_PCT = 85.0  # the conventional "good night" line
+SLEEP_EFFICIENCY_PENALTY_PER_PCT = 2.0   # 85% -> 100, 80% -> 90, 70% -> 70
+
 # Training-load ratio (acute 7d mean / chronic 28d mean). The 0.8-1.3 band is
 # the widely used "sweet spot"; above ~1.5 is the classic spike associated with
 # elevated injury risk in the sports-science literature.
@@ -193,16 +204,65 @@ def rolling_mean(series: dict[date, float], day: date, days: int) -> float | Non
 # ---------------------------------------------------------------------------
 
 def z_to_score(z: float, worse_when_high: bool) -> float:
-    """Map a z-score to 0-100, where 70 is "at baseline"."""
+    """Map a z-score to 0-100, where 70 is "at baseline".
+
+    Seventy rather than fifty so that the usual day is not scored as mediocre,
+    and 15 points per SD so that the whole plausible range of a wearable metric
+    (roughly -2 to +2 SD) lands inside 40-100 without spending most of its days
+    clamped at an end. Every component of the recovery score must agree on this
+    mapping: mixing one scale with another is exactly the bug that made the
+    blend read 79 for a person sitting on their own baseline.
+    """
     directed = -z if worse_when_high else z
     return clamp(70.0 + directed * 15.0)
+
+
+def compute_sleep_component(
+    z: float,
+    value: float,
+    full_credit: float,
+    penalty_per_unit: float,
+) -> float:
+    """Baseline-relative sleep score, capped by an absolute ceiling.
+
+    The two sleep components used to be scored absolutely while the report told
+    the reader all five were baseline-relative. `100 * asleep / 7.5` returns 70
+    at 5.25 hours and saturates at 100 for anyone reaching the target, and raw
+    efficiency is 85-97% for almost everyone — and near 100 by construction when
+    the watch logs no InBed record and efficiency falls back to the onset-to-wake
+    span. That put 35% of the weight on a scale whose centre was not 70, pinning
+    the demo's 938 scored days at a mean of 78.8 against a documented centre of
+    70.
+
+    Scoring sleep purely against the baseline would fix the scale and introduce a
+    worse claim: z = 0 every night is exactly what a settled five-hour habit
+    looks like, and the score would call it recovered forever. So the baseline
+    score is capped, not replaced. At or above `full_credit` the ceiling is 100
+    and the component is whatever the baseline says; below it the ceiling falls
+    by `penalty_per_unit` per unit short, and a five-hour night cannot exceed 50
+    however normal five hours is for this person.
+    """
+    baseline_relative = z_to_score(z, worse_when_high=False)
+    ceiling = 100.0 if value >= full_credit else clamp(100.0 - (full_credit - value) * penalty_per_unit)
+    return min(baseline_relative, ceiling)
 
 
 def recovery_score(parts: dict[str, float | None]) -> tuple[float | None, list[str]]:
     """Transparent weighted blend of recovery signals, 0-100.
 
-    Weights are a judgement call, not a validated instrument — the component
-    breakdown is emitted alongside so the number is auditable rather than magic.
+    Every component arrives on the same scale — 70 is this person's own
+    baseline, ~15 points per SD either side — so the blend means the same thing
+    the components do, and the report can describe it in one sentence without
+    lying. Weights are a judgement call, not a validated instrument, so the
+    component breakdown is emitted alongside and the number stays auditable.
+
+    Missing components are dropped and the rest reweighted rather than counted
+    as zero; below half the weight the score is withheld entirely, because a
+    "recovery score" carried by sleep alone is a sleep score wearing a better
+    name. When it is withheld the input list is empty too: the earlier version
+    returned the components it had, and `daily_insights.csv` grew rows reading
+    `recovery_inputs = sleep_duration+sleep_efficiency` beside a blank
+    `recovery_score` — inputs itemised for a number deliberately not given.
     """
     weights = {
         'hrv': 0.30,
@@ -222,7 +282,7 @@ def recovery_score(parts: dict[str, float | None]) -> tuple[float | None, list[s
         total_w += weight
         used.append(key)
     if total_w < 0.5:
-        return None, used
+        return None, []
     return round(total / total_w, 1), used
 
 

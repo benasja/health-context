@@ -65,12 +65,16 @@ from health_insights import (
     build_series,
     carry_forward,
     circular_stats,
+    compute_sleep_component,
     compute_trends,
     illness_signals,
     isolated_spikes,
     pearson,
+    recovery_score,
+    render_insights_report,
     render_llm_context,
     rolling_baseline,
+    z_to_score,
 )
 import health_ingest
 import health_mcp
@@ -1257,6 +1261,128 @@ class TestTrainingLoadGate(unittest.TestCase):
             row['exercise_minutes'] = '120'
         insights = build_daily_insights(rows, None)
         self.assertEqual(insights[-1]['load_status'], 'spike')
+
+
+class TestRecoveryScore(unittest.TestCase):
+    """The report tells the reader — and the LLM reading the pack — that 70
+    means "at baseline". Two of the five components were scored on an absolute
+    scale instead: sleep duration read 70 at 5.25 h and saturated at 100 for
+    anyone sleeping 7.5 h, and sleep efficiency was passed through as a raw
+    85-97% percentage. 35% of the weight sat above 70 by construction, so a
+    person exactly on their own baseline scored 79 and the demo's 938 scored
+    days averaged 78.8."""
+
+    # A healthy baseline: the absolute sleep ceilings are not binding here, so
+    # every component is purely baseline-relative.
+    BASELINES = {
+        'hrv_sdnn': 60.0,
+        'resting_hr': 55.0,
+        'respiratory_rate': 14.0,
+        'sleep_asleep_hours': 7.6,
+        'sleep_efficiency_pct': 92.0,
+    }
+    WOBBLE = 0.25
+
+    def _rows(self, overrides=None, columns=None, days=70):
+        """Days that alternate around each baseline and end exactly on its mean.
+
+        The alternation exists so every baseline has a non-zero SD — a constant
+        series has none, and `build_daily_insights` withholds the z-score rather
+        than calling it zero. Thirty days either side of the mean leave the final
+        day at z = 0 on every component at once.
+        """
+        means = dict(self.BASELINES)
+        means.update(overrides or {})
+        if columns is not None:
+            means = {k: v for k, v in means.items() if k in columns}
+        rows = []
+        for i in range(days):
+            day = date(2026, 1, 1) + timedelta(days=i)
+            row = {'date': day.isoformat(), 'wear_class': 'full'}
+            for col, mu in means.items():
+                if i == days - 1:
+                    row[col] = f'{mu}'
+                else:
+                    row[col] = f'{mu + (self.WOBBLE if i % 2 else -self.WOBBLE)}'
+            rows.append(row)
+        return rows
+
+    def test_z_of_zero_scores_seventy(self):
+        self.assertEqual(z_to_score(0.0, worse_when_high=False), 70.0)
+        self.assertEqual(z_to_score(0.0, worse_when_high=True), 70.0)
+
+    def test_a_day_at_baseline_on_every_component_scores_seventy_not_seventy_nine(self):
+        last = build_daily_insights(self._rows())[-1]
+        self.assertEqual(last['recovery_inputs'],
+                         'hrv+resting_hr+sleep_duration+sleep_efficiency+respiratory_rate')
+        self.assertEqual(last['recovery_score'], 70.0)
+
+    def test_a_better_than_baseline_night_is_not_capped_at_seventy(self):
+        # 9 h against a 7.6 h baseline is well above target, so the absolute
+        # ceiling must not bind — the floor exists to catch bad habits, not to
+        # flatten good nights.
+        rows = self._rows()
+        rows[-1]['sleep_asleep_hours'] = '9.0'
+        self.assertGreater(build_daily_insights(rows)[-1]['recovery_score'], 70.0)
+
+    def test_a_settled_habit_of_five_hours_does_not_score_as_at_baseline(self):
+        # z = 0 every night, because 5 h *is* this person's baseline. Without an
+        # absolute floor that reads as full recovery indefinitely.
+        last = build_daily_insights(self._rows({'sleep_asleep_hours': 5.0}))[-1]
+        self.assertLess(last['recovery_score'], 70.0)
+        self.assertEqual(last['recovery_score'], 65.0)  # 0.25 weight at 50/100
+
+    def test_a_settled_habit_of_poor_efficiency_does_not_score_as_at_baseline(self):
+        last = build_daily_insights(self._rows({'sleep_efficiency_pct': 60.0}))[-1]
+        self.assertLess(last['recovery_score'], 70.0)
+
+    def test_sleep_ceilings_only_bind_below_the_absolute_target(self):
+        # At or above full credit the component is whatever the baseline says.
+        self.assertEqual(compute_sleep_component(1.0, 8.0, 7.5, 20.0), 85.0)
+        self.assertEqual(compute_sleep_component(0.0, 7.5, 7.5, 20.0), 70.0)
+        # Below it the ceiling takes over, however normal the night is for them.
+        self.assertEqual(compute_sleep_component(0.0, 6.0, 7.5, 20.0), 70.0)
+        self.assertEqual(compute_sleep_component(2.0, 5.0, 7.5, 20.0), 50.0)
+        self.assertEqual(compute_sleep_component(0.0, 3.0, 7.5, 20.0), 10.0)
+
+    def test_the_score_never_leaves_the_zero_to_hundred_range(self):
+        for hours in (0.0, 2.5, 5.0, 7.5, 12.0):
+            for z in (-6.0, 0.0, 6.0):
+                value = compute_sleep_component(z, hours, 7.5, 20.0)
+                self.assertGreaterEqual(value, 0.0)
+                self.assertLessEqual(value, 100.0)
+
+    def test_a_blend_of_components_at_baseline_is_itself_at_baseline(self):
+        score, used = recovery_score({k: 70.0 for k in
+                                      ('hrv', 'resting_hr', 'sleep_duration',
+                                       'sleep_efficiency', 'respiratory_rate')})
+        self.assertEqual(score, 70.0)
+        self.assertEqual(len(used), 5)
+
+    def test_missing_components_reweight_rather_than_count_as_zero(self):
+        score, used = recovery_score({'hrv': 100.0, 'resting_hr': 50.0,
+                                      'sleep_duration': None})
+        self.assertEqual(used, ['hrv', 'resting_hr'])
+        self.assertAlmostEqual(score, (100.0 * 0.30 + 50.0 * 0.25) / 0.55, places=1)
+
+    def test_inputs_are_not_listed_when_the_score_is_withheld(self):
+        # Sleep alone is 0.35 of the weight. The score is withheld, so naming the
+        # inputs that would have produced it describes a number nobody was given.
+        score, used = recovery_score({'sleep_duration': 80.0, 'sleep_efficiency': 90.0})
+        self.assertIsNone(score)
+        self.assertEqual(used, [])
+
+    def test_withheld_score_writes_no_recovery_inputs_column(self):
+        rows = self._rows(columns={'sleep_asleep_hours', 'sleep_efficiency_pct'})
+        last = build_daily_insights(rows)[-1]
+        self.assertEqual(last['recovery_score'], '')
+        self.assertEqual(last['recovery_inputs'], '')
+
+    def test_the_report_does_not_claim_the_sleep_parts_are_purely_relative(self):
+        rows = self._rows()
+        text = render_insights_report(build_daily_insights(rows), [], [], [], None, [])
+        self.assertIn('70 means "at baseline"', text)
+        self.assertIn('absolute', text.split('## Recovery')[1].split('##')[0])
 
 
 class TestCyclingPower(unittest.TestCase):

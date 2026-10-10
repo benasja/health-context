@@ -60,8 +60,10 @@ from health_history import (
     zone_totals,
 )
 from health_insights import (
+    ACWR_LOW,
     ACWR_MIN_CHRONIC_LOAD,
     build_daily_insights,
+    build_rest_days,
     build_series,
     carry_forward,
     circular_stats,
@@ -71,6 +73,7 @@ from health_insights import (
     pearson,
     render_llm_context,
     rolling_baseline,
+    rolling_mean,
 )
 import health_ingest
 import health_mcp
@@ -1257,6 +1260,108 @@ class TestTrainingLoadGate(unittest.TestCase):
             row['exercise_minutes'] = '120'
         insights = build_daily_insights(rows, None)
         self.assertEqual(insights[-1]['load_status'], 'spike')
+
+
+class TestTrainingLoadCountsRestDays(unittest.TestCase):
+    """Apple writes no AppleExerciseTime record at all on a zero-exercise day.
+
+    Both load windows therefore averaged minutes per *training* day while every
+    consumer read them as minutes per calendar day. A Mon/Wed/Sat 60-minute
+    trainer who tapered to one session reported acute 60.0, chronic 60.0, ratio
+    1.00 -- "steady" for a complete taper, because both windows averaged the
+    same 60-minute sessions, only over different numbers of them.
+    """
+
+    MINUTES = 60.0
+    TRAINING_WEEKDAYS = (0, 2, 5)  # Mon / Wed / Sat
+    START = date(2026, 1, 5)       # a Monday
+
+    def _rows(self, weeks: int, taper_weeks: int = 0, wear_class: str = 'full'):
+        """Sparse rows: a rest day carries a row but no exercise_minutes key."""
+        rows = []
+        total = weeks * 7
+        for i in range(total):
+            d = self.START + timedelta(days=i)
+            tapering = i >= total - taper_weeks * 7
+            trains = d.weekday() == 0 if tapering else d.weekday() in self.TRAINING_WEEKDAYS
+            row = {'date': d.isoformat(), 'wear_class': wear_class}
+            if trains:
+                row['exercise_minutes'] = str(self.MINUTES)
+            rows.append(row)
+        return rows
+
+    def test_a_taper_reads_as_detraining_rather_than_steady(self):
+        last = build_daily_insights(self._rows(12, taper_weeks=1), None)[-1]
+        self.assertEqual(last['load_status'], 'detraining')
+        self.assertLess(last['load_ratio'], ACWR_LOW)
+
+    def test_load_means_are_per_calendar_day_not_per_training_day(self):
+        last = build_daily_insights(self._rows(12, taper_weeks=1), None)[-1]
+        # One 60-minute session in the closing 7 days, ten in the closing 28.
+        self.assertAlmostEqual(last['load_acute_7d'], round(60.0 / 7, 1))
+        self.assertAlmostEqual(last['load_chronic_28d'], round(600.0 / 28, 1))
+        self.assertNotEqual(last['load_acute_7d'], self.MINUTES)
+
+    def test_a_steady_trainer_still_reads_as_steady(self):
+        last = build_daily_insights(self._rows(12), None)[-1]
+        self.assertEqual(last['load_status'], 'steady')
+        self.assertAlmostEqual(last['load_ratio'], 1.0)
+
+    def test_the_window_never_reaches_back_before_the_first_day_of_data(self):
+        """Otherwise an athlete's first month reads as a huge ramp."""
+        insights = build_daily_insights(self._rows(12), None)
+        # Day 8: the 28-day window extends 20 days before any data exists. Those
+        # days must not enter the denominator as zeros.
+        eighth = insights[7]
+        self.assertAlmostEqual(eighth['load_chronic_28d'], eighth['load_acute_7d'], delta=6.0)
+        self.assertGreater(eighth['load_chronic_28d'], 20.0)
+        self.assertNotEqual(insights[0]['load_status'], 'spike')
+
+    def test_a_day_the_watch_was_off_is_not_counted_as_a_rest_day(self):
+        """The '' invariant: unmeasured must never be rendered as zero.
+
+        Someone who only straps the watch on to train has no evidence either way
+        about the other days, so those days stay out of the denominator and the
+        mean goes back to being per training day.
+        """
+        rows = self._rows(12)
+        for row in rows:
+            if 'exercise_minutes' not in row:
+                row['wear_class'] = 'none'
+        last = build_daily_insights(rows, None)[-1]
+        self.assertAlmostEqual(last['load_acute_7d'], self.MINUTES)
+        self.assertAlmostEqual(last['load_chronic_28d'], self.MINUTES)
+
+    def test_an_export_with_no_exercise_records_reports_no_load_at_all(self):
+        """The demo generator emits none; a year of confident zeros is worse."""
+        rows = self._rows(12)
+        for row in rows:
+            row.pop('exercise_minutes', None)
+        last = build_daily_insights(rows, None)[-1]
+        self.assertEqual(last['load_acute_7d'], '')
+        self.assertEqual(last['load_chronic_28d'], '')
+        self.assertEqual(last['load_ratio'], '')
+        self.assertEqual(last['load_status'], '')
+
+    def test_rest_days_are_only_the_full_wear_days_with_nothing_recorded(self):
+        rows = self._rows(2)
+        rows[1]['wear_class'] = 'partial'
+        series = build_series(rows, 'exercise_minutes')
+        rest = build_rest_days(rows, series)
+        self.assertIn(date(2026, 1, 8), rest)     # Thursday, full wear, no session
+        self.assertNotIn(date(2026, 1, 6), rest)  # Tuesday, partial wear: no evidence
+        self.assertNotIn(date(2026, 1, 7), rest)  # Wednesday carries a measurement
+
+    def test_rolling_mean_still_skips_unmeasured_days_for_every_other_caller(self):
+        """The general contract is unchanged; counting zeros is opt-in."""
+        series = {date(2026, 1, 5): 10.0, date(2026, 1, 8): 20.0}
+        self.assertAlmostEqual(rolling_mean(series, date(2026, 1, 11), 7), 15.0)
+        self.assertIsNone(rolling_mean({}, date(2026, 1, 11), 7))
+        self.assertAlmostEqual(
+            rolling_mean(series, date(2026, 1, 11), 7,
+                         zero_days=[date(2026, 1, 6), date(2026, 1, 7)]),
+            7.5,
+        )
 
 
 class TestCyclingPower(unittest.TestCase):

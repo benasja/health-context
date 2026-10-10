@@ -75,6 +75,29 @@ jobs:
           echo "daily rows: $rows"
           [ "$rows" -ge 1 ]
 
+      - name: Multi-year demo run actually computes context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The step above proves the pipeline runs. It cannot prove the
+          # pipeline computes anything: percentiles, rolling baselines and
+          # 28-day best windows all need history, and two days of fixture makes
+          # every one of them read n/a while every file check still passes.
+          python fixtures/make_demo_export.py --out-dir demo-run
+          python convert_health_data.py --data-dir demo-run --out-dir demo-run
+          python fixtures/check_demo_output.py demo-run
+
+      - name: Demo export is reproducible
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The assertions above name specific thresholds, which is only sound
+          # if the same seed always produces the same export.
+          python fixtures/make_demo_export.py --out-dir repro-a > /dev/null
+          python fixtures/make_demo_export.py --out-dir repro-b > /dev/null
+          cmp repro-a/export.xml repro-b/export.xml
+          echo "identical across runs"
+
   lint:
     runs-on: ubuntu-latest
     steps:

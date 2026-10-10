@@ -1194,11 +1194,19 @@ def resolve_max_hr(
 
 
 def overlap_minutes(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> float:
+    """Minutes shared by two intervals. A zero-length interval shares nothing.
+
+    This used to return one second for a zero-length `a`, as a private favour
+    to the zone maths, which fed it instantaneous heart-rate samples and needed
+    *something* back. That made a general-purpose predicate lie about an empty
+    interval, and it silently became the answer for every real Apple
+    `HeartRate` record: the demo export's 20,117 workout minutes came out as
+    1,715 zone minutes, 8.5% of the time actually trained. Callers that want to
+    credit an instant a stretch of time now say how long that stretch is.
+    """
     start = max(a_start, b_start)
     end = min(a_end, b_end)
     if end <= start:
-        if a_start == a_end:
-            return 1.0 / 60.0
         return 0.0
     return (end - start).total_seconds() / 60.0
 
@@ -1208,7 +1216,25 @@ def compute_workout_hr_zones(
     hr_samples: list[HealthRecord],
     max_hr: float = DEFAULT_MAX_HR,
 ) -> dict[str, Any]:
-    in_window = [s for s in hr_samples if s.start < workout.end and s.end > workout.start]
+    """Minutes spent in each heart-rate zone, from the sample stream alone.
+
+    Apple writes `HKQuantityTypeIdentifierHeartRate` records instantaneously:
+    startDate == endDate. An earlier version credited each sample the overlap
+    of its own span with the workout, which for an instantaneous record is
+    zero, and fell back to one second apiece. Every export written by the watch
+    -- and the demo generator, which writes them the same way -- therefore
+    reported roughly a twelfth of the truth: 340 workouts totalling 20,117
+    minutes came out as 1,715 zone minutes, and the pack read as though this
+    person had never done a zone-2 session. The sample fixture happened to use
+    range-style records, so the tests stayed green.
+
+    A zone that was never reached comes back `''`, not 0.0 -- a blank means the
+    training never went there, and 0 would invite an LLM to average it in.
+    """
+    # `end >=` rather than `>`: an instantaneous sample taken on the start line
+    # has end == workout.start, and a strict comparison dropped the first
+    # reading of every session the watch recorded.
+    in_window = [s for s in hr_samples if s.start < workout.end and s.end >= workout.start]
     in_window.sort(key=lambda s: s.start)
 
     zone_mins = {f'hr_zone_{z}_min': 0.0 for _, z in HR_ZONE_BOUNDS}
@@ -1219,15 +1245,17 @@ def compute_workout_hr_zones(
         if bpm is None:
             continue
         bpm_values.append(bpm)
-        if i + 1 < len(in_window):
-            next_start = in_window[i + 1].start
-            seg_end = min(sample.end, next_start, workout.end)
-        else:
-            seg_end = workout.end
+        next_start = in_window[i + 1].start if i + 1 < len(in_window) else workout.end
         seg_start = max(sample.start, workout.start)
+        # A reading holds until the next one replaces it. Taking whichever of
+        # the sample's own end and the next sample's start reaches further
+        # keeps a range-style sample's measured span intact while giving an
+        # instantaneous one -- which is what Apple actually writes -- the gap
+        # ahead of it instead of nothing.
+        seg_end = min(max(sample.end, next_start), workout.end)
         minutes = overlap_minutes(seg_start, seg_end, workout.start, workout.end)
-        if minutes <= 0:
-            minutes = 1.0 / 60.0
+        # The watch stops sampling when the wrist goes slack, so one reading in
+        # front of a 40-minute hole must not buy the whole hole.
         minutes = min(minutes, 5.0)
         zone = hr_zone_for_bpm(bpm, max_hr)
         zone_mins[f'hr_zone_{zone}_min'] += minutes
@@ -1266,13 +1294,20 @@ def build_workout_summary(data: ExportData, max_hr: float = DEFAULT_MAX_HR) -> l
 
         distance_km = distance_to_km(workout.total_distance, workout.total_distance_unit)
         if distance_km is None:
-            dist_stat = stat_value(workout, 'HKQuantityTypeIdentifierDistanceCycling', 'sum')
-            if dist_stat is None:
-                dist_stat = stat_value(workout, 'HKQuantityTypeIdentifierDistanceWalkingRunning', 'sum')
-            distance_km = distance_to_km(
-                dist_stat,
-                workout.statistics.get('HKQuantityTypeIdentifierDistanceCycling', {}).get('unit', 'km'),
-            )
+            # The unit has to come off whichever statistic supplied the value.
+            # Reading it off the cycling statistic regardless meant a run --
+            # which carries no cycling statistic -- fell back to the 'km'
+            # default, so a miles-unit export reported every run 1.61x short
+            # and labelled the result km.
+            for dist_type in ('HKQuantityTypeIdentifierDistanceCycling',
+                              'HKQuantityTypeIdentifierDistanceWalkingRunning'):
+                dist_stat = stat_value(workout, dist_type, 'sum')
+                if dist_stat is not None:
+                    distance_km = distance_to_km(
+                        dist_stat,
+                        workout.statistics.get(dist_type, {}).get('unit', 'km'),
+                    )
+                    break
 
         total_kcal = energy_to_kcal(workout.total_energy, workout.total_energy_unit)
         active_kcal = energy_to_kcal(

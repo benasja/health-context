@@ -1,5 +1,5 @@
-Apple Health Coaching Toolkit — Quick start
-============================================
+health-context — Quick start
+============================
 
 ON YOUR COMPUTER (Mac or Windows)
 ---------------------------------
@@ -9,20 +9,23 @@ ON YOUR COMPUTER (Mac or Windows)
 
 2. Export Apple Health on your iPhone:
    Health app -> profile picture -> Export All Health Data
-   Save the zip and unzip it on your computer.
+   Copy the zip to your computer. Do NOT unzip it — the tool reads the zip
+   directly and extracts only the parts it needs.
 
-3. Copy export.xml into this folder (same folder as convert_health_data.py).
+3. Open Terminal (Mac) or Command Prompt (Windows), cd to this folder, run:
 
-4. Open Terminal (Mac) or Command Prompt (Windows), cd to this folder, run:
-
-      python3 convert_health_data.py
+      python3 convert_health_data.py --data-dir ~/Downloads/export.zip
 
    On Windows you may need: py convert_health_data.py
+
+   --data-dir also accepts an unzipped apple_health_export folder, or any
+   folder containing either — point it at ~/Downloads and the newest export
+   found there wins.
 
    A large export (around 1 GB) takes roughly a minute. A progress bar shows
    how far along the parsing is, so silence never means it has hung.
 
-5. Your files appear in this folder:
+4. Your files appear in this folder:
 
    READ THIS FIRST
    - insights_report.md ..... recovery, strain flags, sleep regularity,
@@ -40,6 +43,25 @@ ON YOUR COMPUTER (Mac or Windows)
    - metric_coverage.csv .... when each metric actually started being tracked
    - data_quality_report.txt  watch wear, coverage, multi-device warnings
    - available_types.csv .... every Health type found, with counts
+
+Trying it without your own data
+-------------------------------
+
+   python3 fixtures/make_demo_export.py --out-dir demo
+   python3 convert_health_data.py --data-dir demo --out-dir demo
+
+Writes a synthetic two-and-a-half-year export and analyses it, so you can see
+what the outputs look like before exporting anything of your own. The data is
+fabricated and no number in it is a reference range.
+
+Serving it to an AI assistant (MCP)
+-----------------------------------
+
+   python3 health_mcp.py --data-dir <folder with your outputs> --check
+
+Runs the same data as a local MCP server, so an assistant can query your
+baselines and percentiles directly instead of you pasting a summary. --check
+verifies the setup and exits. See the README for client configuration.
 
 Useful options
 --------------
@@ -60,7 +82,7 @@ Useful options
 Re-running
 ----------
 
-Just run step 4 again — outputs are overwritten, no need to delete anything.
+Just run step 3 again — outputs are overwritten, no need to delete anything.
 
 Your privacy
 ------------

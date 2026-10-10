@@ -20,18 +20,23 @@ from datetime import date, datetime, timedelta, timezone
 from health_coaching import (
     DEDUP_INTERVAL_TYPES,
     DEDUP_PRIMARY_TYPES,
+    ExportData,
     HealthRecord,
     Workout,
     aggregate_sleep_by_day,
+    build_workout_summary,
+    compute_workout_hr_zones,
     dedup_interval_sum,
     dedup_primary_sum,
     detect_coverage,
     energy_to_kcal,
+    hr_zone_for_bpm,
     is_stand_hour_met,
     is_watch_source,
     local_calendar_date,
     normalize_source,
     observed_max_hr,
+    overlap_minutes,
     resolve_max_hr,
     source_priority,
 )
@@ -1315,6 +1320,206 @@ class TestCyclingPower(unittest.TestCase):
         self.assertAlmostEqual(summary.best_avg_w, 125.0)
         self.assertEqual(summary.best_day, date(2026, 5, 8))
         self.assertAlmostEqual(summary.max_w, 610.0)
+
+
+class TestWorkoutHeartRateZones(unittest.TestCase):
+    """Zone minutes are the headline of the training half of the context pack.
+
+    Apple writes `HeartRate` records instantaneously -- `startDate ==
+    endDate` -- so a sample's own span is zero and cannot be the credited
+    interval. An earlier version took `min(sample.end, next_start,
+    workout.end)` as the segment end, which for instantaneous samples
+    collapsed to the sample's own timestamp and credited one second each. On
+    the demo export that turned 20,117 workout minutes into 1,715 zone
+    minutes: the pack said 340 workouts carried zone data directly above a
+    table claiming the person had done under two hours of it in three years.
+    """
+
+    def _workout(self, start, end, activity='HKWorkoutActivityTypeCycling'):
+        return Workout(
+            workout_activity_type=activity, start=start, end=end,
+            start_raw=start.isoformat(), end_raw=end.isoformat(), creation='',
+            duration=(end - start).total_seconds() / 60.0, duration_unit='min',
+            total_energy=None, total_energy_unit='kcal',
+            total_distance=None, total_distance_unit='km',
+            source_name='Apple Watch',
+        )
+
+    def _hr(self, start, bpm, end=None):
+        return rec('HKQuantityTypeIdentifierHeartRate', bpm, 'Apple Watch',
+                   start, end or start, unit='count/min')
+
+    def _total(self, stats):
+        return sum(float(stats[f'hr_zone_{z}_min'] or 0.0) for z in ('z1', 'z2', 'z3', 'z4', 'z5'))
+
+    def test_instantaneous_samples_are_credited_the_interval_to_the_next_sample(self):
+        # The regression: a 60-minute ride sampled every 5 minutes is 60 zone
+        # minutes, not the 0.2 that one second per sample produced.
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 18, 0)
+        samples = [self._hr(start + timedelta(minutes=5 * i), 140.0) for i in range(12)]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 60.0, places=2)
+        self.assertAlmostEqual(float(stats['hr_zone_z3_min']), 60.0, places=2)
+
+    def test_range_style_samples_keep_their_measured_span(self):
+        # The sample fixture writes 14:00:00 -> 14:05:00 spans; those already
+        # worked and must go on working, zone by zone.
+        start, end = dt(2026, 5, 1, 14, 0), dt(2026, 5, 1, 14, 15)
+        samples = [
+            self._hr(dt(2026, 5, 1, 14, 0), 110.0, dt(2026, 5, 1, 14, 5)),
+            self._hr(dt(2026, 5, 1, 14, 5), 150.0, dt(2026, 5, 1, 14, 10)),
+            self._hr(dt(2026, 5, 1, 14, 10), 150.0, dt(2026, 5, 1, 14, 15)),
+        ]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(float(stats['hr_zone_z1_min']), 5.0, places=2)
+        self.assertAlmostEqual(float(stats['hr_zone_z3_min']), 10.0, places=2)
+        self.assertAlmostEqual(self._total(stats), 15.0, places=2)
+
+    def test_a_range_sample_shorter_than_the_gap_still_reaches_the_next_sample(self):
+        # A 10-second span followed by a 5-minute gap is the same measurement
+        # situation as an instantaneous sample, and is credited the same way.
+        start, end = dt(2026, 5, 1, 9, 0), dt(2026, 5, 1, 9, 10)
+        samples = [
+            self._hr(start, 140.0, start + timedelta(seconds=10)),
+            self._hr(start + timedelta(minutes=5), 140.0, start + timedelta(minutes=5, seconds=10)),
+        ]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 10.0, places=2)
+
+    def test_credited_time_never_runs_past_the_end_of_the_workout(self):
+        start, end = dt(2026, 5, 1, 7, 0), dt(2026, 5, 1, 7, 10)
+        samples = [self._hr(start + timedelta(minutes=8), 140.0)]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 2.0, places=2)
+
+    def test_credited_time_never_runs_before_the_start_of_the_workout(self):
+        # The warm-up reading straddles the start line; only the minute of it
+        # that falls inside the workout belongs to z1.
+        start, end = dt(2026, 5, 1, 7, 0), dt(2026, 5, 1, 7, 4)
+        samples = [
+            self._hr(dt(2026, 5, 1, 6, 57), 110.0, dt(2026, 5, 1, 7, 1)),
+            self._hr(dt(2026, 5, 1, 7, 1), 150.0, dt(2026, 5, 1, 7, 4)),
+        ]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(float(stats['hr_zone_z1_min']), 1.0, places=2)
+        self.assertAlmostEqual(float(stats['hr_zone_z3_min']), 3.0, places=2)
+        self.assertAlmostEqual(self._total(stats), 4.0, places=2)
+
+    def test_a_long_gap_between_samples_is_capped_at_five_minutes(self):
+        # The watch stops sampling when the wrist goes slack. One reading must
+        # not buy the whole 40-minute hole it sits in front of.
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 18, 0)
+        samples = [self._hr(start, 140.0), self._hr(start + timedelta(minutes=40), 140.0)]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 10.0, places=2)
+
+    def test_a_zone_never_reached_is_blank_and_never_zero(self):
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 17, 30)
+        samples = [self._hr(start + timedelta(minutes=5 * i), 140.0) for i in range(6)]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        for zone in ('z1', 'z2', 'z4', 'z5'):
+            self.assertEqual(stats[f'hr_zone_{zone}_min'], '')
+
+    def test_a_workout_with_no_samples_reports_blank_heart_rate(self):
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 18, 0)
+        stats = compute_workout_hr_zones(self._workout(start, end), [], max_hr=190.0)
+        self.assertEqual(stats['avg_heart_rate_bpm'], '')
+        self.assertEqual(stats['max_heart_rate_bpm'], '')
+        self.assertEqual(self._total(stats), 0.0)
+
+    def test_a_sample_taken_on_the_start_line_is_not_dropped(self):
+        # An instantaneous sample at the gun has end == workout.start, which a
+        # strict `end > workout.start` window threw away -- the first reading
+        # of every session the watch recorded.
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 17, 10)
+        samples = [self._hr(start, 140.0), self._hr(start + timedelta(minutes=5), 140.0)]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 10.0, places=2)
+
+    def test_samples_outside_the_workout_window_are_ignored(self):
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 18, 0)
+        samples = [
+            self._hr(dt(2026, 5, 1, 12, 0), 60.0),
+            self._hr(start + timedelta(minutes=30), 140.0),
+            self._hr(dt(2026, 5, 1, 21, 0), 60.0),
+        ]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(stats['avg_heart_rate_bpm'], 140.0, places=1)
+
+    def test_samples_arriving_out_of_order_are_still_credited_in_time_order(self):
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 17, 20)
+        samples = [
+            self._hr(start + timedelta(minutes=10), 140.0),
+            self._hr(start, 140.0),
+            self._hr(start + timedelta(minutes=5), 140.0),
+        ]
+        stats = compute_workout_hr_zones(self._workout(start, end), samples, max_hr=190.0)
+        self.assertAlmostEqual(self._total(stats), 15.0, places=2)
+
+    def test_zone_boundaries_follow_percent_of_max_heart_rate(self):
+        self.assertEqual(hr_zone_for_bpm(100.0, 200.0), 'z1')   # 50%
+        self.assertEqual(hr_zone_for_bpm(130.0, 200.0), 'z2')   # 65%
+        self.assertEqual(hr_zone_for_bpm(150.0, 200.0), 'z3')   # 75%
+        self.assertEqual(hr_zone_for_bpm(170.0, 200.0), 'z4')   # 85%
+        self.assertEqual(hr_zone_for_bpm(190.0, 200.0), 'z5')   # 95%
+        self.assertEqual(hr_zone_for_bpm(210.0, 200.0), 'z5')   # above max
+
+    def test_disjoint_intervals_do_not_overlap(self):
+        a = dt(2026, 5, 1, 10, 0)
+        self.assertEqual(
+            overlap_minutes(a, a + timedelta(minutes=5), a + timedelta(minutes=10),
+                            a + timedelta(minutes=20)),
+            0.0,
+        )
+
+    def test_a_zero_length_interval_inside_the_window_is_not_credited_time(self):
+        a = dt(2026, 5, 1, 10, 0)
+        self.assertEqual(overlap_minutes(a, a, a, a + timedelta(minutes=20)), 0.0)
+
+
+class TestWorkoutDistanceUnits(unittest.TestCase):
+    """A distance is only a number until you know which statistic's unit it came
+    from.
+
+    The fallback to `DistanceWalkingRunning` once read its unit off
+    `DistanceCycling`, which is absent on a run -- so the `'km'` default
+    applied and every mile-unit run came out 1.61x short, silently labelled km.
+    """
+
+    def _run(self, distance, unit):
+        start, end = dt(2026, 5, 1, 7, 0), dt(2026, 5, 1, 8, 0)
+        return Workout(
+            workout_activity_type='HKWorkoutActivityTypeRunning', start=start, end=end,
+            start_raw=start.isoformat(), end_raw=end.isoformat(), creation='',
+            duration=60.0, duration_unit='min',
+            total_energy=None, total_energy_unit='kcal',
+            total_distance=None, total_distance_unit='',
+            source_name='Apple Watch',
+            statistics={'HKQuantityTypeIdentifierDistanceWalkingRunning':
+                        {'sum': distance, 'unit': unit}},
+        )
+
+    def _row(self, workout):
+        data = ExportData()
+        data.workouts = [workout]
+        return build_workout_summary(data)[0]
+
+    def test_a_run_measured_in_miles_is_converted_not_relabelled(self):
+        self.assertAlmostEqual(self._row(self._run(6.0, 'mi'))['distance_km'], 9.656, places=3)
+
+    def test_a_run_measured_in_kilometres_is_left_alone(self):
+        self.assertAlmostEqual(self._row(self._run(9.0, 'km'))['distance_km'], 9.0, places=3)
+
+    def test_a_ride_still_reads_its_unit_from_the_cycling_statistic(self):
+        ride = self._run(6.0, 'mi')
+        ride.workout_activity_type = 'HKWorkoutActivityTypeCycling'
+        ride.statistics = {'HKQuantityTypeIdentifierDistanceCycling': {'sum': 20.0, 'unit': 'mi'}}
+        self.assertAlmostEqual(self._row(ride)['distance_km'], 32.187, places=3)
+
+    def test_a_workout_with_no_distance_statistic_stays_blank(self):
+        run = self._run(6.0, 'mi')
+        run.statistics = {}
+        self.assertEqual(self._row(run)['distance_km'], '')
 
 
 class TestMcpOrdinals(unittest.TestCase):

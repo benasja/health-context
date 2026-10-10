@@ -2038,7 +2038,6 @@ class TestPackagingMetadata(unittest.TestCase):
     """The MCP server announces its own version; nothing kept it honest."""
 
     def test_mcp_server_version_matches_pyproject(self):
-        import pathlib
 
         import health_mcp
 

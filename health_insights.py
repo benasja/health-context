@@ -16,7 +16,7 @@ import statistics
 from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import health_history
 from health_history import HistoryResult
@@ -39,6 +39,10 @@ WORSE_WHEN_HIGH = {'resting_hr', 'respiratory_rate', 'wrist_temp_c', 'breathing_
 
 SLEEP_TARGET_HOURS = 7.5
 
+# The only wear class that lets a blank cumulative cell be read as a zero: at
+# 18+ recorded hours the watch was on for any session the day contained.
+FULL_WEAR_CLASS = 'full'
+
 # Training-load ratio (acute 7d mean / chronic 28d mean). The 0.8-1.3 band is
 # the widely used "sweet spot"; above ~1.5 is the classic spike associated with
 # elevated injury risk in the sports-science literature.
@@ -51,7 +55,12 @@ ACWR_HIGH = 1.5
 # The classification would then describe one workout, not a training pattern.
 # The threshold is ~150 min/week, the WHO minimum-activity guideline, which is
 # also roughly where a session stops dominating the ratio.
-ACWR_MIN_CHRONIC_LOAD = 21.0  # minutes/day averaged over 28 days
+#
+# Comparing it against a weekly guideline only works because the mean it gates
+# is now per calendar day (see `build_rest_days`). While rest days were dropped
+# from the denominator the gate ran permissive: 2x60 min/week is 120 min/week,
+# below the guideline, but read as a chronic load of 60 and was rated anyway.
+ACWR_MIN_CHRONIC_LOAD = 21.0  # minutes/day averaged over 28 calendar days
 
 ILLNESS_MIN_SIGNALS = 2
 
@@ -146,6 +155,40 @@ def build_series(rows: list[dict[str, Any]], column: str) -> dict[date, float]:
     return out
 
 
+def build_rest_days(rows: list[dict[str, Any]], series: dict[date, float]) -> frozenset[date]:
+    """Days whose blank cell is evidence of a zero rather than of nothing recorded.
+
+    Apple writes no AppleExerciseTime record at all on a day with no exercise,
+    so `build_series` drops rest days and any mean taken over what is left is
+    minutes per *training* day while every consumer reads it as minutes per
+    calendar day. Someone training Mon/Wed/Sat for 60 minutes and then tapering
+    to a single session reported acute 60.0, chronic 60.0, ratio 1.00 -- a
+    complete taper rendered as "steady", because both windows averaged the same
+    60-minute sessions and only the count of them changed. Counting the rest
+    days gives 8.6 against 21.4, ratio 0.40, which is detraining.
+
+    This does not license zero-filling the series itself: `build_metric_series`
+    argues against that correctly, and '' still means "not measured" and must
+    never render as 0. So a blank is read as a zero only where both halves of
+    the evidence are present. The day must carry a full-wear row -- the watch
+    was on for 18+ hours and would have seen the session, which a partial-wear
+    day cannot promise -- and the export must record the metric somewhere at
+    all, because an export that never emits the type (the demo generator emits
+    no AppleExerciseTime whatsoever) would otherwise report years of confident
+    zeros for a question it was never asked.
+    """
+    if not series:
+        return frozenset()
+    out: set[date] = set()
+    for row in rows:
+        if row.get('wear_class') != FULL_WEAR_CLASS:
+            continue
+        d = date.fromisoformat(row['date'])
+        if d not in series:
+            out.add(d)
+    return frozenset(out)
+
+
 def carry_forward(series: dict[date, float], dates: list[date], max_gap_days: int = 45) -> dict[date, float]:
     """Hold the last measurement forward — a weight taken Monday is still the
     best estimate for Tuesday — but not indefinitely past a long gap."""
@@ -183,8 +226,30 @@ def rolling_baseline(
     return out
 
 
-def rolling_mean(series: dict[date, float], day: date, days: int) -> float | None:
-    vals = [series[day - timedelta(days=k)] for k in range(days) if (day - timedelta(days=k)) in series]
+def rolling_mean(
+    series: dict[date, float],
+    day: date,
+    days: int,
+    zero_days: Collection[date] = (),
+) -> float | None:
+    """Mean over the `days`-day window ending on and including `day`.
+
+    A day absent from the series is absent from the denominator too. The series
+    holds measurements and a metric that was not recorded is not a zero, so the
+    default answer is "mean of the days that were measured".
+
+    `zero_days` is the narrow opt-in for the metrics where a blank genuinely is
+    a zero and the *caller* can prove it -- see `build_rest_days`, which is the
+    only thing that passes it. Those days enter the denominator at 0.0, turning
+    a mean per measured day into a mean per calendar day. A day that carries a
+    measurement is unaffected whether or not it appears in `zero_days`.
+    """
+    zeros = frozenset(zero_days)
+    vals = [
+        series.get(d, 0.0)
+        for d in (day - timedelta(days=k) for k in range(days))
+        if d in series or d in zeros
+    ]
     return statistics.mean(vals) if vals else None
 
 
@@ -332,6 +397,7 @@ def build_daily_insights(
     baselines = {col: rolling_baseline(series[col], dates) for col in BASELINE_METRICS}
 
     load_series = build_series(rows, 'exercise_minutes')
+    rest_days = build_rest_days(rows, load_series)
     midpoint_series = build_series(rows, 'sleep_midpoint_hour')
 
     out: list[dict[str, Any]] = []
@@ -381,8 +447,11 @@ def build_daily_insights(
         rec['strain_detail'] = '; '.join(signals)
 
         # --- training load ratio
-        acute = rolling_mean(load_series, d, 7)
-        chronic = rolling_mean(load_series, d, 28)
+        # Rest days are counted as zeros so both means are per calendar day;
+        # without that the ratio compares training-day averages and a taper
+        # cancels out of both sides of it.
+        acute = rolling_mean(load_series, d, 7, zero_days=rest_days)
+        chronic = rolling_mean(load_series, d, 28, zero_days=rest_days)
         rec['load_acute_7d'] = round(acute, 1) if acute is not None else ''
         rec['load_chronic_28d'] = round(chronic, 1) if chronic is not None else ''
         if acute is not None and chronic and chronic > 0:
@@ -771,7 +840,9 @@ def render_insights_report(
             '## Training load',
             '',
             f"- Latest acute:chronic ratio: **{latest['load_ratio']}** ({latest['load_status']}) — "
-            f"7-day mean {latest['load_acute_7d']} min/day vs 28-day mean {latest['load_chronic_28d']} min/day",
+            f"7-day mean {latest['load_acute_7d']} min/day vs 28-day mean {latest['load_chronic_28d']} min/day, "
+            f'averaged over calendar days: a full-wear day with no exercise recorded counts as a zero, '
+            f'while a day the watch was off is left out of both the numerator and the denominator',
         ])
         if latest.get('load_status') == 'volume too low to rate':
             lift = round(45.0 / 7.0, 1)

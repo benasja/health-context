@@ -11,6 +11,8 @@ plausible-looking wrong numbers rather than an error. Stdlib only:
 import csv
 import json
 import os
+import pathlib
+import re
 import plistlib
 import tempfile
 import zipfile
@@ -2036,7 +2038,7 @@ class TestPackagingMetadata(unittest.TestCase):
     """The MCP server announces its own version; nothing kept it honest."""
 
     def test_mcp_server_version_matches_pyproject(self):
-        import re
+        import pathlib
 
         import health_mcp
 
@@ -2057,3 +2059,41 @@ class TestPackagingMetadata(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+class TestReadmeMatchesTheServer(unittest.TestCase):
+    """The README is the only thing most people will ever read.
+
+    It said the MCP server exposed 12 tools when it exposed 13, and the table
+    below that sentence was missing `health_profile` entirely. Nobody noticed
+    because nothing compared the two. A tool that exists and is undocumented is
+    a tool nobody calls, and a count that is wrong is the first thing a reader
+    checks and the first reason to doubt the rest.
+    """
+
+    def setUp(self):
+        root = pathlib.Path(__file__).resolve().parent
+        self.readme = (root / 'README.md').read_text(encoding='utf-8')
+        self.server = (root / 'health_mcp.py').read_text(encoding='utf-8')
+
+    def _server_tools(self):
+        return re.findall(r"@tool\(\s*['\"]([a-z_]+)['\"]", self.server)
+
+    def _readme_tools(self):
+        return re.findall(r'^\| `(health_[a-z_]+)` \|', self.readme, re.M)
+
+    def test_every_tool_the_server_exposes_is_documented(self):
+        missing = [t for t in self._server_tools() if t not in self._readme_tools()]
+        self.assertEqual(missing, [], f'tools missing from the README table: {missing}')
+
+    def test_the_readme_documents_no_tool_the_server_lacks(self):
+        server = self._server_tools()
+        extra = [t for t in self._readme_tools() if t not in server]
+        self.assertEqual(extra, [], f'README documents tools that do not exist: {extra}')
+
+    def test_the_stated_tool_count_is_the_real_one(self):
+        stated = re.search(r'exposing (\d+) tools over stdio', self.readme)
+        self.assertIsNotNone(stated, 'the README no longer states a tool count')
+        self.assertEqual(
+            int(stated.group(1)), len(self._server_tools()),
+            'the README\'s tool count and the server disagree',
+        )

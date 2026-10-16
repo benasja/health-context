@@ -160,6 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help='Your Apple Health export. Accepts the .zip straight from your '
                         'phone, the unzipped apple_health_export folder, or a folder '
                         'containing either (the newest .zip wins). Default: next to this script.')
+    p.add_argument('--bridge-db', default=None,
+                   help='Read from a Health Bridge receiver database instead of an export '
+                        '(e.g. ~/.local/share/health-bridge/health.sqlite). Opened read-only. '
+                        'Needs --out-dir. See docs/health-bridge.md.')
+    p.add_argument('--timezone', default=None,
+                   help='With --bridge-db: the IANA zone your days are counted in, e.g. '
+                        'Europe/Vilnius. Default: the zone the phone reported.')
     p.add_argument('--out-dir', default=None,
                    help='Where to write outputs (default: same as --data-dir)')
     p.add_argument('--max-hr', type=float, default=None,
@@ -188,6 +195,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
+    if args.bridge_db:
+        if args.data_dir:
+            print('Error: use --data-dir for an export or --bridge-db for a receiver, not both.')
+            raise SystemExit(1)
+        if not args.out_dir:
+            # Defaulting to the database's own folder would scatter CSVs through
+            # the receiver's private data directory.
+            print('Error: --bridge-db needs --out-dir (where to write the results).')
+            raise SystemExit(1)
+
     requested = args.data_dir or os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.abspath(args.out_dir or requested)
 
@@ -208,6 +225,12 @@ def main() -> None:
     print('Apple Health Data Converter')
     print('=' * 60)
 
+    data = ExportData()
+    if args.bridge_db:
+        _load_bridge(args, data)
+        _write_outputs(args, out_dir, data)
+        return
+
     try:
         found = health_ingest.resolve(requested, out_dir, force=args.force_extract)
     except (ValueError, zipfile.BadZipFile) as exc:
@@ -221,8 +244,6 @@ def main() -> None:
     export_xml = os.path.join(base_dir, 'export.xml')
     export_cda_xml = os.path.join(base_dir, 'export_cda.xml')
     ecg_dir = os.path.join(base_dir, 'electrocardiograms')
-
-    data = ExportData()
 
     if os.path.exists(export_xml):
         iter_export_xml(export_xml, data)
@@ -252,6 +273,33 @@ def main() -> None:
     else:
         print(f"Note: {export_cda_xml} not found (optional)")
 
+    _write_outputs(args, out_dir, data, ecg_dir)
+
+
+def _load_bridge(args: argparse.Namespace, data: ExportData) -> None:
+    """Fill `data` from a Health Bridge receiver, and say plainly what was read."""
+    import health_bridge_import as bridge
+
+    print(f'Health Bridge database: {args.bridge_db} (read-only)')
+    try:
+        summary = bridge.load_into(data, args.bridge_db, args.timezone)
+    except bridge.BridgeError as exc:
+        print(f'Error: {exc}')
+        raise SystemExit(1) from exc
+    print(f'  Timezone: {summary.timezone_name} ({summary.timezone_reason})')
+    print(f'  Read {summary.samples:,} samples ({summary.daily_totals:,} of them daily totals '
+          f'from the phone), {summary.sleep_stages:,} sleep stages, {summary.workouts:,} workouts')
+    if summary.raw_replaced_by_daily_total:
+        print(f'  Left out {summary.raw_replaced_by_daily_total:,} raw samples on days the phone '
+              'already sent its own de-duplicated total for')
+    if summary.unmapped_types:
+        print('  Not recognised, left out: ' + ', '.join(
+            f'{name} ({count})' for name, count in summary.unmapped_types.most_common()))
+
+
+def _write_outputs(args: argparse.Namespace, out_dir: str, data: ExportData,
+                   ecg_dir: str | None = None) -> None:
+    """Everything after the data is loaded -- identical for an export and a receiver."""
     output_csv = os.path.join(out_dir, 'full_health_data.csv')
     legacy_rows = []
     if args.skip_legacy:
@@ -260,7 +308,7 @@ def main() -> None:
         legacy_rows = records_to_legacy_rows(data)
         ecg_seen = {(r['creationDate'], r['startDate'], r['endDate'], r['type'], r['value'])
                     for r in legacy_rows}
-        if os.path.exists(ecg_dir):
+        if ecg_dir and os.path.exists(ecg_dir):
             parse_ecg_legacy(ecg_dir, legacy_rows, ecg_seen)
         legacy_rows.sort(key=lambda x: x['startDate'])
         print(f"\nWriting legacy export: {output_csv}")
@@ -316,6 +364,7 @@ def main() -> None:
     print(f"Parsed {n_days:,} days; analysis window {span}.")
     print(f"\nStart with {insight_paths['insights_report']}")
     print(f"Paste {insight_paths['llm_context']} into an LLM for coaching.")
+
 
 
 if __name__ == '__main__':

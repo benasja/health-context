@@ -87,6 +87,18 @@ jobs:
           python convert_health_data.py --data-dir demo-run --out-dir demo-run
           python fixtures/check_demo_output.py demo-run
 
+      - name: A Health Bridge database gives the same answers as the export
+        # The receiver runs on macOS and Linux only, and Python on Windows has
+        # no timezone database without the tzdata package.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same export, shaped the way the companion app sends it -- UTC,
+          # 0-100 percentages, the phone's daily totals -- must produce the same
+          # baselines, scores, flags and reports.
+          python fixtures/check_bridge_equivalence.py demo-run
+
       - name: Demo export is reproducible
         shell: bash
         run: |

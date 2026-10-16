@@ -283,6 +283,9 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `health_insights.py` | Baselines, z-scores, scores, flags, trends, associations, reports |
 | `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
+| `health_bridge_import.py` | Reads a Health Bridge receiver's database in place of an export |
+| `health_sync.py` | Unattended rebuild loop for a receiver, with atomic snapshots |
+| `health_mcp.py` | MCP server over the generated files |
 
 ## Ask questions instead of reading files (MCP server)
 
@@ -445,9 +448,32 @@ says so explicitly and instructs the reader not to guess.
 
 **Apple provides no way to trigger an export programmatically** — no API, no
 Shortcuts action, no iCloud sync of the export file. "Export All Health Data" is
-a manual tap, and nothing here can change that. (Third-party HealthKit apps that
-hold Apple's entitlements can write exports on a schedule; that is the only
-automated source.)
+a manual tap. There are two ways around that.
+
+### Fully automatic: Health Bridge on a home server
+
+[Health Bridge for AI](https://github.com/roian6/apple-health-ai-bridge) is an
+iPhone app that syncs Apple Health in the background to a receiver on a Mac or
+Linux machine you own. health-context reads the receiver's database directly —
+read-only, never touching its pairing or credential tables — and gives the same
+results as an export of the same data; CI checks that on every change.
+
+`health_sync.py` keeps the pack current from it, rebuilding whenever the phone
+has synced. A rebuild never replaces the data an open session is reading, and a
+failed one leaves the last good pack in place:
+
+```bash
+python3 health_sync.py --bridge-db ~/.local/share/health-bridge/health.sqlite \
+    --out-root ~/health-context-data
+python3 health_mcp.py --data-dir ~/health-context-data/current --check
+```
+
+There is a Docker Compose file for running it next to the receiver on a home
+server, and the MCP server can be reached from a laptop over SSH. Setup,
+troubleshooting and the few things the app does not sync:
+[docs/health-bridge.md](docs/health-bridge.md).
+
+### Semi-automatic: from the newest export
 
 Everything *after* the export can be automated, and the manual part reduces to:
 export, AirDrop to your Downloads folder, done.
@@ -463,14 +489,14 @@ macOS, a systemd service and timer on Linux, a `schtasks` command on Windows —
 with real paths already filled in. Save or run it as the comment says.
 
 From then on it rebuilds monthly from the newest export in that folder. The MCP
-server re-reads on every call, so it needs no restart, and if you forget to
-export it tells the model the data is stale rather than quietly answering from
-old numbers.
+server notices rebuilt files on its next call, so it needs no restart, and if you
+forget to export it tells the model the data is stale rather than quietly
+answering from old numbers.
 
 ## Development
 
 ```bash
-python3 test_health.py                  # 157 tests, stdlib only
+python3 test_health.py                  # 265 tests, stdlib only
 pip install ruff && ruff check .
 ```
 
@@ -489,7 +515,7 @@ health-data file is ever tracked by git**.
 
 Your export stays on your machine; the tool makes no network calls. `.gitignore`
 excludes `export.xml`, `export_cda.xml`, `apple_health_export/`,
-`electrocardiograms/`, `workout-routes/`, `*.zip` and all generated CSVs —
+`electrocardiograms/`, `workout-routes/`, `*.zip`, `*.sqlite` and all generated CSVs —
 health data should never enter git history, where every version lives forever.
 CI enforces this, so a fork cannot quietly regress it.
 

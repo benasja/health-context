@@ -30,6 +30,7 @@ dependencies = []
 [project.scripts]
 health-convert = "convert_health_data:main"
 health-mcp = "health_mcp:main"
+health-sync = "health_sync:main"
 
 [project.urls]
 Homepage = "https://github.com/benasja/health-context"
@@ -47,4 +48,5 @@ py-modules = [
     "health_insights",
     "health_mcp",
     "health_metrics",
+    "health_sync",
 ]

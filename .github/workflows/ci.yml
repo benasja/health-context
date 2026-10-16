@@ -42,11 +42,12 @@ jobs:
           cp fixtures/sample_export.xml ci-run/export.xml
           python convert_health_data.py --data-dir ci-run
 
-      - name: Packaging installs and exposes both entry points
+      - name: Packaging installs and exposes every entry point
         shell: bash
         run: |
           python -m pip install --quiet .
           health-convert --help > /dev/null
+          health-sync --help > /dev/null
           health-mcp --data-dir ci-run --check
 
       - name: Every expected output exists and is non-empty
@@ -131,7 +132,7 @@ jobs:
           # Health data must never enter git history. This repo is public and
           # git keeps every version forever, so a single bad commit is not
           # undone by deleting the file later.
-          bad=$(git ls-files | grep -E '(^|/)(export\.xml|export_cda\.xml|export\.zip)$|^apple_health_export/|^electrocardiograms/|^workout-routes/' || true)
+          bad=$(git ls-files | grep -E '(^|/)(export\.xml|export_cda\.xml|export\.zip)$|\.sqlite(-wal|-journal)?$|^apple_health_export/|^electrocardiograms/|^workout-routes/' || true)
           if [ -n "$bad" ]; then
             echo "personal health data is tracked by git:"
             echo "$bad"

@@ -1,0 +1,33 @@
+# Automatic sync from a Health Bridge receiver on the same machine.
+#
+#   cp .env.example .env     # then edit it: your user id and the paths
+#   docker compose up -d --build
+#   docker compose logs -f   # "now serving ..." after each sync from the phone
+#
+# Full walkthrough: docs/health-bridge.md
+services:
+  health-context:
+    build: ..
+    container_name: health-context
+    restart: unless-stopped
+    # Must be the user the receiver runs as: its database is readable by that
+    # user only (mode 0600).
+    user: "${HEALTH_UID:?set HEALTH_UID in .env}:${HEALTH_GID:?set HEALTH_GID in .env}"
+    # It reads two folders and writes one. It never needs the network.
+    network_mode: none
+    read_only: true
+    # SQLite puts temporary files in /tmp when it needs them.
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      # Read-only: nothing in this container can alter the receiver's data.
+      - ${HEALTH_BRIDGE_DIR:?set HEALTH_BRIDGE_DIR in .env}:/bridge:ro
+      - ${HEALTH_OUTPUT_DIR:?set HEALTH_OUTPUT_DIR in .env}:/output
+    command:
+      - --bridge-db
+      - /bridge/health.sqlite
+      - --out-root
+      - /output
+      - --interval
+      - "${HEALTH_SYNC_INTERVAL:-900}"

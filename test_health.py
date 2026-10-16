@@ -2309,5 +2309,211 @@ class TestHealthBridgeImport(unittest.TestCase):
             conn.close()
 
 
+@unittest.skipUnless(os.name == 'posix' and _zone_available('Etc/GMT-3'),
+                     'needs symlinks and a timezone database; the receiver runs on macOS/Linux')
+class TestHealthSync(unittest.TestCase):
+    """The unattended rebuild loop that sits next to a Health Bridge receiver.
+
+    What matters is what a reader sees while it runs: never a half-written
+    folder, never nothing after a failure, never the folder it is reading
+    deleted under it.
+    """
+
+    def setUp(self):
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures'))
+        import subprocess
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, 'health.sqlite')
+        self.out = os.path.join(self.tmp, 'out')
+        here = os.path.dirname(os.path.abspath(__file__))
+        subprocess.run([_sys.executable, os.path.join(here, 'fixtures', 'make_bridge_db.py'),
+                        '--export', os.path.join(here, 'fixtures', 'sample_export.xml'),
+                        '--out', self.db], check=True, capture_output=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _args(self, **overrides):
+        import health_sync
+        argv = ['--bridge-db', self.db, '--out-root', self.out]
+        args = health_sync.build_parser().parse_args(argv)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        os.makedirs(self.out, exist_ok=True)
+        return args
+
+    def test_a_rebuild_lands_complete_behind_a_relative_link(self):
+        import health_sync
+        name = health_sync.rebuild(self._args())
+        self.assertIsNotNone(name)
+        link = os.path.join(self.out, 'current')
+        # Relative, so the same folder still resolves when mounted elsewhere
+        # (inside a container at /output, on the host at ~/health-data).
+        self.assertEqual(os.readlink(link), os.path.join('snapshots', name))
+        self.assertTrue(os.path.isfile(os.path.join(link, 'daily_metrics.csv')))
+        self.assertTrue(os.path.isfile(os.path.join(link, 'llm_context.md')))
+        # Nothing in progress is left where a reader could find it.
+        self.assertEqual(os.listdir(os.path.join(self.out, 'snapshots')), [name])
+        self.assertFalse(os.path.exists(os.path.join(self.out, '.work')))
+
+    def test_a_failed_rebuild_keeps_serving_the_last_good_one(self):
+        import health_sync
+        good = health_sync.rebuild(self._args())
+        with open(self.db, 'wb') as handle:
+            handle.write(b'not a database')
+        self.assertIsNone(health_sync.rebuild(self._args()))
+        self.assertEqual(health_sync.current_snapshot(self.out), good)
+        self.assertEqual(health_sync.snapshot_names(os.path.join(self.out, 'snapshots')), [good])
+
+    def test_a_converter_failure_leaves_no_partial_folder(self):
+        import health_sync
+        good = health_sync.rebuild(self._args())
+        # An unknown timezone gets past the copy and fails inside the
+        # converter, after it has started writing into the new folder.
+        self.assertIsNone(health_sync.rebuild(self._args(timezone='Not/A_Zone')))
+        self.assertEqual(health_sync.current_snapshot(self.out), good)
+        leftovers = [n for n in os.listdir(os.path.join(self.out, 'snapshots')) if n != good]
+        self.assertEqual(leftovers, [])
+
+    def test_pruning_keeps_the_newest_and_never_the_current_one(self):
+        import health_sync
+        snapshots = os.path.join(self.out, 'snapshots')
+        names = [f'2026010{i}T000000Z' for i in range(1, 6)]
+        for name in names:
+            os.makedirs(os.path.join(snapshots, name))
+        # Current pointing at an old one: a newer rebuild exists but the switch
+        # to it never happened. Deleting what readers are using would be worse
+        # than keeping one folder too many.
+        health_sync.switch_current(self.out, names[0])
+        removed = health_sync.prune(self.out, keep=2)
+        self.assertEqual(removed, names[1:3])
+        self.assertEqual(health_sync.snapshot_names(snapshots), [names[0]] + names[3:])
+
+    def test_an_interrupted_rebuild_is_cleaned_up_on_start(self):
+        import health_sync
+        snapshots = os.path.join(self.out, 'snapshots')
+        os.makedirs(os.path.join(snapshots, '20260101T000000Z.partial'))
+        os.makedirs(os.path.join(self.out, '.work'))
+        health_sync.clear_leftovers(self.out)
+        self.assertEqual(os.listdir(snapshots), [])
+        self.assertFalse(os.path.exists(os.path.join(self.out, '.work')))
+
+    def test_a_commit_in_wal_mode_changes_the_fingerprint(self):
+        # In WAL mode a commit goes to the -wal file and the main file is not
+        # touched until a checkpoint. Watching the main file alone would miss
+        # every sync until then.
+        import health_sync
+        before = health_sync.fingerprint(self.db)
+        with open(self.db + '-wal', 'wb') as handle:
+            handle.write(b'x' * 32)
+        self.assertNotEqual(health_sync.fingerprint(self.db), before)
+
+    def test_the_source_database_is_not_modified(self):
+        import hashlib
+        import health_sync
+        digest = hashlib.sha256(pathlib.Path(self.db).read_bytes()).hexdigest()
+        health_sync.rebuild(self._args())
+        self.assertEqual(hashlib.sha256(pathlib.Path(self.db).read_bytes()).hexdigest(), digest)
+        self.assertEqual(sorted(os.listdir(self.tmp)), ['health.sqlite', 'out'])
+
+    def test_a_wal_database_is_recognised_so_the_error_can_say_what_to_change(self):
+        # A WAL database in a read-only folder cannot be opened at all (SQLite
+        # must write its -shm file even to read), and SQLite's own message is
+        # "unable to open database file". The header says which case it is.
+        import sqlite3
+        from health_bridge_import import in_wal_mode
+        self.assertFalse(in_wal_mode(self.db))
+        conn = sqlite3.connect(self.db)
+        conn.execute('pragma journal_mode=wal')
+        conn.close()
+        self.assertTrue(in_wal_mode(self.db))
+        self.assertFalse(in_wal_mode(os.path.join(self.tmp, 'missing.sqlite')))
+
+    def test_the_receivers_credentials_are_not_copied(self):
+        # The working copy sits in the output folder, which may well be backed
+        # up or synced somewhere. Pairing secrets must not travel with it.
+        import sqlite3
+        import health_sync
+        conn = sqlite3.connect(self.db)
+        conn.execute('create table pairing_credentials (secret text)')
+        conn.execute("insert into pairing_credentials values ('do-not-copy')")
+        conn.commit()
+        conn.close()
+        target = os.path.join(self.tmp, 'copy.sqlite')
+        health_sync.copy_database(self.db, target)
+        copy = sqlite3.connect(target)
+        tables = {row[0] for row in copy.execute("select name from sqlite_master where type='table'")}
+        copy.close()
+        import health_bridge_import
+        self.assertEqual(tables, set(health_bridge_import.REQUIRED_COLUMNS))
+        self.assertNotIn(b'do-not-copy', pathlib.Path(target).read_bytes())
+
+    def test_one_snapshot_is_refused(self):
+        import subprocess
+        import sys as _sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run([_sys.executable, os.path.join(here, 'health_sync.py'),
+                                 '--bridge-db', self.db, '--out-root', self.out,
+                                 '--keep', '1', '--once'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--keep must be at least 2', result.stderr)
+
+    def test_before_the_first_rebuild_the_server_says_to_check_the_sync_log(self):
+        # Telling the model to run the converter by hand would be wrong advice
+        # when a sync loop owns the folder; and once the first rebuild lands,
+        # the same session must start answering without a restart.
+        import health_sync
+        from health_mcp import HealthData
+        self._args()
+        open(os.path.join(self.out, '.lock'), 'w').close()
+        data = HealthData(os.path.join(self.out, 'current'))
+        data.follow()
+        self.assertFalse(data.ready())
+        self.assertIn("health_sync.py", data.missing_data_message())
+        self.assertNotIn('convert_health_data.py', data.missing_data_message())
+        health_sync.rebuild(self._args())
+        data.follow()
+        self.assertTrue(data.ready())
+
+    def test_the_mcp_server_sees_files_rebuilt_in_place(self):
+        # The monthly scheduled rebuild writes into the same folder. The cache
+        # used to live for the whole session, so the new month only appeared
+        # after restarting the client.
+        import health_sync
+        from health_mcp import HealthData
+        name = health_sync.rebuild(self._args())
+        folder = os.path.join(self.out, 'snapshots', name)
+        data = HealthData(folder)
+        data.follow()
+        before = data.table('daily')
+        data.follow()
+        self.assertIs(data.table('daily'), before)
+        path = os.path.join(folder, 'daily_metrics.csv')
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write('')
+        os.utime(path, ns=(1, 1))
+        data.follow()
+        self.assertIsNot(data.table('daily'), before)
+
+    def test_the_mcp_server_follows_the_link_once_per_call(self):
+        import health_sync
+        from health_mcp import HealthData
+        first = health_sync.rebuild(self._args())
+        data = HealthData(os.path.join(self.out, 'current'))
+        data.follow()
+        rows_before = data.table('daily')
+        self.assertTrue(rows_before)
+        second = health_sync.rebuild(self._args())
+        self.assertNotEqual(first, second)
+        # Until the next call starts, reads stay on the folder the call began on.
+        self.assertTrue(data.dir.endswith(first))
+        self.assertIs(data.table('daily'), rows_before)
+        data.follow()
+        self.assertTrue(data.dir.endswith(second))
+        self.assertIsNot(data.table('daily'), rows_before)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

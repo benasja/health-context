@@ -40,6 +40,7 @@ Issues = "https://github.com/benasja/health-context/issues"
 # packaging and renaming files would break every path in the README for no gain.
 py-modules = [
     "convert_health_data",
+    "health_bridge_import",
     "health_coaching",
     "health_history",
     "health_ingest",

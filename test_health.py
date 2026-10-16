@@ -17,15 +17,18 @@ import plistlib
 import tempfile
 import zipfile
 import unittest
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 from health_coaching import (
     DEDUP_INTERVAL_TYPES,
     DEDUP_PRIMARY_TYPES,
+    SLEEP_TYPE,
     ExportData,
     HealthRecord,
     Workout,
     aggregate_sleep_by_day,
+    build_daily_metrics,
     build_workout_summary,
     compute_workout_hr_zones,
     dedup_interval_sum,
@@ -2056,9 +2059,6 @@ class TestPackagingMetadata(unittest.TestCase):
         )
 
 
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
-
 class TestReadmeMatchesTheServer(unittest.TestCase):
     """The README is the only thing most people will ever read.
 
@@ -2096,3 +2096,218 @@ class TestReadmeMatchesTheServer(unittest.TestCase):
             int(stated.group(1)), len(self._server_tools()),
             'the README\'s tool count and the server disagree',
         )
+
+
+def _zone_available(name: str) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:  # noqa: BLE001 -- any failure means "no tz database here"
+        return False
+
+
+@unittest.skipUnless(_zone_available('Europe/Vilnius'),
+                     'no timezone database (Windows without tzdata); the receiver runs on macOS/Linux')
+class TestHealthBridgeImport(unittest.TestCase):
+    """Reading a Health Bridge receiver's database instead of an export.
+
+    Each test is one translation the importer has to get right. Every one of
+    them, got wrong, produces a plausible number rather than an error: SpO2 at
+    9,700%, an evening run on tomorrow's date, steps counted as only the Watch's
+    share. fixtures/check_bridge_equivalence.py covers the whole pipeline; these
+    pin each rule on its own so a failure names the rule.
+    """
+
+    def setUp(self):
+        import sqlite3
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures'))
+        import make_bridge_db
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, 'health.sqlite')
+        conn = sqlite3.connect(self.db)
+        conn.executescript(make_bridge_db.MINIMAL_SCHEMA)
+        conn.execute("insert into sources (source_id, source_key, name, kind) "
+                     "values (1, 'apple_health.phone', 'Apple Health on iPhone', 'phone')")
+        conn.commit()
+        conn.close()
+        self.serial = 0
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _sample(self, hk, type_code, start, end, value, unit, **meta):
+        import sqlite3
+        self.serial += 1
+        meta.setdefault('healthkit_identifier', hk)
+        conn = sqlite3.connect(self.db)
+        conn.execute('insert into samples (source_id, type_code, client_record_id, start_time, end_time, '
+                     'value, unit, metadata_json) values (1, ?, ?, ?, ?, ?, ?, ?)',
+                     (type_code, f't{self.serial}', start, end, value, unit, json.dumps(meta)))
+        conn.commit()
+        conn.close()
+
+    def _load(self, tz='Europe/Vilnius'):
+        import health_bridge_import
+        data = ExportData()
+        summary = health_bridge_import.load_into(data, self.db, tz)
+        rows, _, _ = build_daily_metrics(data)
+        return data, summary, {r['date']: r for r in rows}
+
+    def test_a_percentage_from_the_bridge_reads_as_a_percentage_not_a_hundred_times_it(self):
+        # The companion app sends 0-100; export.xml holds a fraction and the
+        # metric registry scales it by 100. Passed through, 97 became 9700.
+        self._sample('HKQuantityTypeIdentifierOxygenSaturation', 'oxygen_saturation',
+                     '2026-06-01T08:00:00Z', '2026-06-01T08:00:00Z', 97.0, '%',
+                     healthkit_source_name='Apple Watch', sample_kind='raw_quantity')
+        _data, _summary, days = self._load()
+        self.assertEqual(float(days['2026-06-01']['spo2_avg']), 97.0)
+
+    def test_a_late_evening_sample_lands_on_the_local_day_not_the_utc_one(self):
+        # 22:30 UTC on 1 June is 01:30 on 2 June in Vilnius. A receiver in a
+        # container usually runs on UTC, so trusting the machine's zone would put
+        # every after-midnight reading on the previous day.
+        self._sample('HKQuantityTypeIdentifierRestingHeartRate', 'resting_heart_rate',
+                     '2026-06-01T22:30:00Z', '2026-06-01T22:30:00Z', 52.0, 'bpm',
+                     healthkit_source_name='Apple Watch', sample_kind='raw_quantity')
+        _data, _summary, days = self._load()
+        self.assertIn('2026-06-02', days)
+        self.assertEqual(float(days['2026-06-02']['resting_hr']), 52.0)
+        self.assertNotEqual(days.get('2026-06-01', {}).get('resting_hr', ''), '52.0')
+
+    def test_the_phones_daily_total_wins_over_raw_samples_for_the_same_day(self):
+        # Apple's per-day total is already merged across iPhone and Watch. If the
+        # raw Watch samples went in too, interval de-duplication would prefer the
+        # Watch and discard the merged total, losing every step the phone saw.
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-05-31T21:00:00Z', '2026-06-01T21:00:00Z', 9000.0, 'count',
+                     aggregation='daily_sum', healthkit_query='HKStatisticsCollectionQuery',
+                     calendar_day='2026-06-01', time_zone_identifier='Europe/Vilnius')
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-06-01T06:00:00Z', '2026-06-01T06:10:00Z', 1200.0, 'count',
+                     healthkit_source_name='Apple Watch', sample_kind='raw_quantity')
+        _data, summary, days = self._load()
+        self.assertEqual(float(days['2026-06-01']['steps']), 9000.0)
+        self.assertEqual(summary.raw_replaced_by_daily_total, 1)
+
+    def test_raw_samples_still_count_on_a_day_without_a_daily_total(self):
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-06-03T06:00:00Z', '2026-06-03T06:10:00Z', 1200.0, 'count',
+                     healthkit_source_name='Apple Watch', sample_kind='raw_quantity')
+        _data, _summary, days = self._load()
+        self.assertEqual(float(days['2026-06-03']['steps']), 1200.0)
+
+    def test_a_daily_total_stays_on_the_day_the_phone_counted_it_on(self):
+        # Even when --timezone differs from the phone's, calendar_day decides.
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-05-31T21:00:00Z', '2026-06-01T21:00:00Z', 7000.0, 'count',
+                     aggregation='daily_sum', calendar_day='2026-06-01',
+                     time_zone_identifier='Europe/Vilnius')
+        _data, _summary, days = self._load(tz='America/New_York')
+        self.assertEqual(float(days['2026-06-01']['steps']), 7000.0)
+
+    def test_walking_speed_in_metres_per_second_becomes_kmh(self):
+        self._sample('HKQuantityTypeIdentifierWalkingSpeed', 'walking_speed',
+                     '2026-06-01T08:00:00Z', '2026-06-01T08:01:00Z', 1.25, 'm/s',
+                     healthkit_source_name='iPhone', sample_kind='raw_quantity')
+        _data, _summary, days = self._load()
+        self.assertAlmostEqual(float(days['2026-06-01']['walking_speed_kmh']), 4.5, places=6)
+
+    def test_sleep_stages_map_onto_apples_and_a_stageless_session_is_only_in_bed(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("insert into sleep_sessions (sleep_session_id, source_id, client_record_id, "
+                     "start_time, end_time) values (1, 1, 'n1', '2026-06-01T20:00:00Z', '2026-06-02T04:00:00Z')")
+        for stage, s, e in [('in_bed', '20:00', '20:15'), ('core', '20:15', '23:00'),
+                            ('deep', '23:00', '00:30'), ('rem', '00:30', '02:00'), ('awake', '02:00', '02:10'),
+                            ('core', '02:10', '04:00')]:
+            sd = '2026-06-01' if s >= '20:00' else '2026-06-02'
+            ed = '2026-06-01' if e >= '20:00' and s >= '20:00' else '2026-06-02'
+            conn.execute('insert into sleep_stage_intervals (sleep_session_id, stage, start_time, end_time) '
+                         'values (1, ?, ?, ?)', (stage, f'{sd}T{s}:00Z', f'{ed}T{e}:00Z'))
+        conn.execute("insert into sleep_sessions (sleep_session_id, source_id, client_record_id, "
+                     "start_time, end_time) values (2, 1, 'n2', '2026-06-05T20:00:00Z', '2026-06-06T04:00:00Z')")
+        conn.commit()
+        conn.close()
+        data, summary, days = self._load()
+        labels = Counter(r.category_value for r in data.records if r.type == SLEEP_TYPE)
+        self.assertEqual(labels['HKCategoryValueSleepAnalysisAsleepDeep'], 1)
+        self.assertEqual(labels['HKCategoryValueSleepAnalysisAsleepREM'], 1)
+        # Woke at 07:00 local on 2 June: the night belongs to that morning.
+        self.assertAlmostEqual(float(days['2026-06-02']['sleep_deep_hours']), 1.5, places=2)
+        # The stageless night became one in-bed record, so no sleep was invented.
+        self.assertEqual(labels['HKCategoryValueSleepAnalysisInBed'], 2)
+        self.assertEqual(days.get('2026-06-06', {}).get('sleep_hours', ''), '')
+
+    def test_a_workout_lands_where_the_summary_reads_its_type_and_distance(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
+                     "duration_seconds, energy_kcal, distance_meters) values "
+                     "(1, 'w1', 'running', '2026-06-01T15:00:00Z', '2026-06-01T15:40:00Z', 2400, 380.0, 7500.0), "
+                     "(1, 'w2', 'kickboxing_maybe', '2026-06-02T15:00:00Z', '2026-06-02T15:30:00Z', 1800, 200.0, NULL)")
+        conn.commit()
+        conn.close()
+        data, summary, _days = self._load()
+        rows = build_workout_summary(data)
+        run = next(r for r in rows if 'Running' in r['activity_type'])
+        self.assertEqual(run['distance_km'], 7.5)
+        self.assertEqual(run['duration_min'], 40.0)
+        self.assertEqual(run['active_energy_kcal'], 380.0)
+        self.assertEqual(run['date'], '2026-06-01')
+        self.assertTrue(any('Other' in r['activity_type'] for r in rows))
+        self.assertEqual(summary.workouts, 2)
+
+    def test_the_receivers_database_is_never_written(self):
+        import hashlib
+        import sqlite3
+
+        import health_bridge_import
+        self._sample('HKQuantityTypeIdentifierHeartRate', 'heart_rate',
+                     '2026-06-01T08:00:00Z', '2026-06-01T08:00:00Z', 70.0, 'bpm', sample_kind='raw_quantity')
+        before = hashlib.sha256(open(self.db, 'rb').read()).hexdigest()
+        self._load()
+        self.assertEqual(hashlib.sha256(open(self.db, 'rb').read()).hexdigest(), before)
+        conn = health_bridge_import.open_readonly(self.db)
+        with self.assertRaises(sqlite3.OperationalError):
+            conn.execute("insert into sources (source_key, name, kind) values ('x', 'x', 'phone')")
+        conn.close()
+
+    def test_a_missing_database_is_reported_and_not_created(self):
+        import health_bridge_import
+        missing = os.path.join(self.tmp, 'nope.sqlite')
+        with self.assertRaises(health_bridge_import.BridgeError):
+            health_bridge_import.load_into(ExportData(), missing, 'Europe/Vilnius')
+        self.assertFalse(os.path.exists(missing))
+
+    def test_a_schema_it_was_not_written_for_is_refused_by_name(self):
+        import sqlite3
+
+        import health_bridge_import
+        conn = sqlite3.connect(self.db)
+        conn.execute('drop table sleep_stage_intervals')
+        conn.commit()
+        conn.close()
+        with self.assertRaises(health_bridge_import.BridgeError) as caught:
+            health_bridge_import.load_into(ExportData(), self.db, 'Europe/Vilnius')
+        self.assertIn('sleep_stage_intervals', str(caught.exception))
+
+    def test_an_explicit_timezone_beats_the_phones_which_beats_the_machines(self):
+        import health_bridge_import
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-05-31T21:00:00Z', '2026-06-01T21:00:00Z', 7000.0, 'count',
+                     aggregation='daily_sum', calendar_day='2026-06-01', time_zone_identifier='Europe/Vilnius')
+        conn = health_bridge_import.open_readonly(self.db)
+        try:
+            _tz, name, reason = health_bridge_import.resolve_timezone(conn, 'Asia/Tokyo')
+            self.assertEqual((name, reason), ('Asia/Tokyo', 'set with --timezone'))
+            _tz, name, reason = health_bridge_import.resolve_timezone(conn, None)
+            self.assertEqual((name, reason), ('Europe/Vilnius', 'reported by the phone'))
+        finally:
+            conn.close()
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

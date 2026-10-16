@@ -666,6 +666,56 @@ class ProgressFile:
         self.close()
 
 
+def add_parsed_record(
+    data: ExportData,
+    record_type: str,
+    *,
+    start_raw: str,
+    end_raw: str,
+    value_raw: str,
+    unit: str,
+    source_name: str,
+    creation: str,
+    start_dt: datetime | None,
+    end_dt: datetime | None,
+) -> bool:
+    """Fold one record into `data`, the same way whatever it was read from.
+
+    Split out of the export.xml loop so that every input -- the XML export, and
+    a Health Bridge receiver's database (health_bridge_import.py) -- goes through
+    one de-duplication, one set of daily aggregates and one retention rule. Two
+    copies of this would drift, and the place they would drift is the
+    double-counting logic, which is exactly where a second copy is least safe.
+
+    Returns True when the record was new and usable. `record_type` must already
+    be one of ALL_PARSED_TYPES; counting it in `type_counts` is the caller's job,
+    because the XML loop counts every record it sees, parsed or not.
+    """
+    if data.mark_seen(creation, start_raw, end_raw, record_type, value_raw, source_name):
+        return False
+    if not (start_dt and end_dt):
+        return False
+    data.sources[normalize_source(source_name)] += 1
+    ingest_record(data, record_type, value_raw, unit, source_name, start_dt, end_dt)
+    if record_type in RETAINED_TYPES:
+        numeric = parse_float(value_raw)
+        data.records.append(
+            HealthRecord(
+                type=record_type,
+                value=numeric,
+                category_value=value_raw if numeric is None else '',
+                unit=unit,
+                source_name=source_name,
+                start=start_dt,
+                end=end_dt,
+                creation=creation,
+                start_raw=start_raw,
+                end_raw=end_raw,
+            )
+        )
+    return True
+
+
 def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True) -> int:
     import xml.etree.ElementTree as ET
 
@@ -691,36 +741,19 @@ def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True)
                 if record_type in ALL_PARSED_TYPES:
                     start_raw = elem.get('startDate', '')
                     end_raw = elem.get('endDate', '')
-                    value_raw = elem.get('value', '') or ''
-                    unit = elem.get('unit', '') or ''
-                    source_name = elem.get('sourceName', '') or ''
-                    creation = elem.get('creationDate', '') or ''
-
-                    if not data.mark_seen(creation, start_raw, end_raw, record_type,
-                                          value_raw, source_name):
-                        start_dt = parse_health_datetime(start_raw)
-                        end_dt = parse_health_datetime(end_raw)
-                        if start_dt and end_dt:
-                            data.sources[normalize_source(source_name)] += 1
-                            ingest_record(data, record_type, value_raw, unit,
-                                          source_name, start_dt, end_dt)
-                            if record_type in RETAINED_TYPES:
-                                numeric = parse_float(value_raw)
-                                data.records.append(
-                                    HealthRecord(
-                                        type=record_type,
-                                        value=numeric,
-                                        category_value=value_raw if numeric is None else '',
-                                        unit=unit,
-                                        source_name=source_name,
-                                        start=start_dt,
-                                        end=end_dt,
-                                        creation=creation,
-                                        start_raw=start_raw,
-                                        end_raw=end_raw,
-                                    )
-                                )
-                            added += 1
+                    if add_parsed_record(
+                        data,
+                        record_type,
+                        start_raw=start_raw,
+                        end_raw=end_raw,
+                        value_raw=elem.get('value', '') or '',
+                        unit=elem.get('unit', '') or '',
+                        source_name=elem.get('sourceName', '') or '',
+                        creation=elem.get('creationDate', '') or '',
+                        start_dt=parse_health_datetime(start_raw),
+                        end_dt=parse_health_datetime(end_raw),
+                    ):
+                        added += 1
                 elem.clear()
 
             elif elem.tag == 'Workout':

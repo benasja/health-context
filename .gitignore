@@ -26,6 +26,8 @@ profile.md
 
 # --- Junk ---
 __pycache__/
+build/
+*.egg-info/
 .ruff_cache/
 .DS_Store
 

@@ -7,6 +7,10 @@ apple_health_export/
 electrocardiograms/
 electrocardiograms
 workout-routes/
+# A Health Bridge receiver database, or a copy of one
+*.sqlite
+*.sqlite-wal
+*.sqlite-journal
 
 # --- Generated outputs (all derived from personal health data) ---
 full_health_data.csv
@@ -21,6 +25,10 @@ coaching_types_usage.txt
 insights_report.md
 llm_context.md
 
+# health_sync.py's output folder layout
+snapshots/
+current
+
 # --- Personal context (yours alone; the template is what ships) ---
 profile.md
 
@@ -34,3 +42,6 @@ build/
 # Belt-and-braces: the generated filenames above already match at any
 # depth, but a future output would not.
 output/
+
+# deploy/.env holds your paths and user id
+deploy/.env

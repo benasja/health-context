@@ -1,0 +1,5 @@
+# Only the source goes into the image. Above all, no health data: a context
+# pack or receiver database copied in here would end up in every layer pushed.
+*
+!*.py
+!profile.example.md

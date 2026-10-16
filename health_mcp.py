@@ -79,6 +79,14 @@ def read_text(path: str) -> str:
         return f.read()
 
 
+def _size_and_mtime(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
 class HealthData:
     """Lazily-loaded view over the generated outputs."""
 
@@ -96,8 +104,39 @@ class HealthData:
     }
 
     def __init__(self, data_dir: str):
-        self.dir = os.path.abspath(data_dir)
+        self.root = os.path.abspath(data_dir)
+        self.dir = os.path.realpath(self.root)
         self._cache: dict[str, Any] = {}
+        self._stamp = self._file_stamp()
+
+    def _file_stamp(self) -> tuple:
+        return tuple(_size_and_mtime(os.path.join(self.dir, name))
+                     for name in (*self.FILES.values(), *self.DOCS.values()))
+
+    def follow(self) -> None:
+        """Drop cached tables if the data on disk has changed since they were read.
+
+        Called once at the start of each tool call. Tables are loaded lazily
+        and cached for the session, which without this meant a rebuild was
+        invisible until the client was restarted. Two ways the data changes:
+
+        * health_sync.py keeps data_dir as a link it switches to each new
+          rebuild; the link now points somewhere else.
+        * A scheduled convert_health_data.py rewrote the files in place.
+
+        Checking here rather than on every read keeps one answer to one
+        rebuild: following a moved link mid-call could pair this hour's daily
+        metrics with last hour's weekly summary.
+        """
+        target = os.path.realpath(self.root)
+        if target != self.dir:
+            log(f'data moved to {target}')
+            self.dir = target
+            self._cache.clear()
+        stamp = self._file_stamp()
+        if stamp != self._stamp:
+            self._stamp = stamp
+            self._cache.clear()
 
     # -- loading
 
@@ -116,6 +155,16 @@ class HealthData:
         return bool(self.table('daily'))
 
     def missing_data_message(self) -> str:
+        parent = os.path.dirname(self.root)
+        if os.path.isdir(os.path.join(parent, 'snapshots')) or os.path.exists(
+                os.path.join(parent, '.lock')):
+            # A health_sync.py output folder: telling the model to run the
+            # converter by hand would be wrong advice; the loop is doing it.
+            return (
+                f'No health data in {self.root} yet. health_sync.py is set up to write '
+                'it but has not finished a rebuild: either the first one is still '
+                'running, or it is failing. Its log says which.'
+            )
         return (
             f'No health data found in {self.dir}.\n\n'
             'Generate it first:\n'
@@ -740,6 +789,7 @@ def handle(message: dict[str, Any], data: HealthData) -> dict[str, Any] | None:
         handler = HANDLERS.get(name)
         if handler is None:
             return make_error(request_id, -32602, f'Unknown tool: {name}')
+        data.follow()
         if not data.ready():
             return make_result(request_id, {
                 'content': [{'type': 'text', 'text': data.missing_data_message()}],

@@ -32,6 +32,7 @@ Layout of --out-root:
     snapshots/20261016T081500Z/   the newest complete rebuild
     snapshots/20261016T074500Z/   kept so a session reading it can finish
     profile.md                    optional; used for every rebuild if present
+    sync_status.json              how the last rebuild went, for the MCP server
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ CONVERTER = os.path.join(HERE, 'convert_health_data.py')
 CURRENT = 'current'
 SNAPSHOTS = 'snapshots'
 WORK = '.work'
+SYNC_STATUS = 'sync_status.json'
 STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 STAMP_RE = re.compile(r'^\d{8}T\d{6}Z$')
 
@@ -214,6 +216,7 @@ def rebuild(args: argparse.Namespace) -> str | None:
             copy_database(args.bridge_db, db_copy)
         except Exception as exc:  # noqa: BLE001 - logged, retried next round
             log(f'could not read {args.bridge_db}: {exc}')
+            note_attempt(out_root, f'could not read the receiver database: {exc}')
             return None
 
         result = subprocess.run(converter_command(args, db_copy, partial),
@@ -224,12 +227,14 @@ def rebuild(args: argparse.Namespace) -> str | None:
                 f'{current_snapshot(out_root) or "nothing yet"}. Converter said:')
             for line in output[-FAILURE_TAIL:]:
                 print('    ' + line, flush=True)
+            note_attempt(out_root, output[-1] if output else f'converter exited {result.returncode}')
             shutil.rmtree(partial, ignore_errors=True)
             return None
 
         _note_check_interval(partial, args.interval)
         os.rename(partial, os.path.join(snapshot_dir, name))
         switch_current(out_root, name)
+        note_attempt(out_root)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -239,6 +244,25 @@ def rebuild(args: argparse.Namespace) -> str | None:
     log(f'now serving {name} ({time.monotonic() - started:.1f}s). {summary}'
         + (f' Removed {len(removed)} old snapshot(s).' if removed else ''))
     return name
+
+
+def note_attempt(out_root: str, error: str = '') -> None:
+    """Record how the last rebuild went, next to `current`.
+
+    A failed rebuild leaves `current` on the last good snapshot, which is right
+    for the answers but silent: they look complete while everything synced
+    since is missing. The MCP server reads this and says so in every answer.
+    """
+    status = {'ok': not error, 'at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+    if error:
+        status['error'] = error[:300]
+    path = os.path.join(out_root, SYNC_STATUS)
+    try:
+        with open(path + '.tmp', 'w', encoding='utf-8') as handle:
+            json.dump(status, handle)
+        os.replace(path + '.tmp', path)
+    except OSError as exc:
+        log(f'could not write {path}: {exc}')
 
 
 def _note_check_interval(snapshot: str, interval_s: float) -> None:

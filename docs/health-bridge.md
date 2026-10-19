@@ -191,6 +191,16 @@ sample's `healthkit_identifier` metadata, or the type's alias), in these units:
 The equivalence check sends all of them, so CI proves they arrive exactly as
 an export would have them: stand hours on every day, power on every ride.
 
+A sample's `healthkit_device_name` metadata, if the client sends it
+(`sample.device?.name`), names the hardware that measured it. Power the Watch
+records from a paired trainer or power meter has the Watch as its source and
+the trainer only as its device, so without it every ride reads as "Apple
+Watch".
+
+If a rebuild fails, `current` keeps serving the last good one and every MCP
+answer starts with a warning saying so, with the reason, until a rebuild
+succeeds.
+
 Sleep and workouts are labelled with the companion app as their source rather
 than the Watch. Only the label changes.
 

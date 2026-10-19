@@ -404,6 +404,7 @@ def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],
             value_raw=value_raw, unit=export_unit,
             source_name=str(name), creation=created_at,
             start_dt=start, end_dt=end,
+            device='' if daily else str(meta.get('healthkit_device_name') or ''),
         ):
             summary.samples += 1
             if daily:

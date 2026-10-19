@@ -190,7 +190,7 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
             # Not retained for interval de-duplication (stand time, basal energy):
             # the plain per-day sum is what the daily accumulator would see.
             per_day = defaultdict(float)
-            for start, _end, value, unit, record_type, _source in raw:
+            for start, _end, value, unit, record_type, _source, _device in raw:
                 if record_type == hk:
                     per_day[local_calendar_date(start)] += value
                     unit_of[hk] = unit
@@ -208,16 +208,18 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
             counts['daily_totals'] += 1
 
     # Raw samples: everything not summed, plus steps again as raw Watch samples.
-    for start, end, value, unit, hk, source_name in raw:
+    for start, end, value, unit, hk, source_name, device in raw:
         if hk not in TYPES:
             counts['skipped_unsupported'] += 1
             continue
         if hk in DAILY_TOTAL_TYPES and hk not in ALSO_RAW:
             continue
-        sample(hk, utc(start), utc(end), to_bridge_value(hk, value, unit),
-               {'aggregation': TYPES[hk][3], 'healthkit_identifier': hk,
+        meta = {'aggregation': TYPES[hk][3], 'healthkit_identifier': hk,
                 'healthkit_object_kind': 'quantity', 'healthkit_query': 'HKAnchoredObjectQuery',
-                'healthkit_source_name': source_name, 'sample_kind': 'raw_quantity'})
+                'healthkit_source_name': source_name, 'sample_kind': 'raw_quantity'}
+        if device:
+            meta['healthkit_device_name'] = device
+        sample(hk, utc(start), utc(end), to_bridge_value(hk, value, unit), meta)
         counts['raw_samples'] += 1
 
     # Stand hours: a category, so HealthKit's number rather than the export's label.
@@ -283,7 +285,7 @@ def _all_raw(export_xml: str):
     """Every Record with a numeric value, straight from the XML."""
     import xml.etree.ElementTree as ET
 
-    from health_coaching import parse_float, parse_health_datetime
+    from health_coaching import device_name, parse_float, parse_health_datetime
     for _event, elem in ET.iterparse(export_xml, events=('end',)):
         if elem.tag == 'Record':
             value = parse_float(elem.get('value', ''))
@@ -291,7 +293,7 @@ def _all_raw(export_xml: str):
             end = parse_health_datetime(elem.get('endDate', ''))
             if value is not None and start and end:
                 yield start, end, value, elem.get('unit', '') or '', elem.get('type', ''), \
-                    elem.get('sourceName', '') or ''
+                    elem.get('sourceName', '') or '', device_name(elem.get('device', ''))
             elem.clear()
 
 

@@ -30,6 +30,8 @@ from health_coaching import (
     aggregate_sleep_by_day,
     build_daily_metrics,
     build_workout_series,
+    device_name,
+    main_source,
     build_workout_summary,
     compute_workout_hr_zones,
     dedup_interval_sum,
@@ -1905,6 +1907,21 @@ class TestWorkoutSeries(unittest.TestCase):
         self.assertAlmostEqual(rows[1]['power_max_w'], 300.0)
         self.assertEqual(rows[0]['cadence_avg_rpm'], '')
 
+    def test_the_measuring_device_wins_over_the_app_that_wrote_it(self):
+        # Power the Watch recorded from a paired trainer: Watch as source,
+        # trainer as device. The trainer is what tells two rides apart.
+        at = dt(2026, 5, 1, 17, 0)
+        power = rec('HKQuantityTypeIdentifierCyclingPower', 150, 'Apple Watch', at, at, unit='W')
+        power.device = 'Domyos Bridge'
+        hr = rec('HKQuantityTypeIdentifierHeartRate', 120, 'Apple Watch', at, at, unit='count/min')
+        self.assertEqual(main_source([power, power, hr]), 'Domyos Bridge')
+        self.assertEqual(main_source([hr]), 'Apple Watch')
+
+    def test_device_name_from_an_export(self):
+        self.assertEqual(device_name('<<HKDevice: 0x6000>, name:Domyos Bridge, manufacturer:x, model:y>'),
+                         'Domyos Bridge')
+        self.assertEqual(device_name(''), '')
+
     def test_the_summary_names_which_device_recorded_what(self):
         row = build_workout_summary(self._data())[0]
         self.assertEqual(row['hr_source'], 'Apple Watch')
@@ -2022,6 +2039,11 @@ class TestMcpWorkoutAnswers(unittest.TestCase):
         self.assertIn('| minute |', text)
         self.assertIn('| 44 |', text)
 
+    def test_detail_from_a_build_without_series_says_so(self):
+        os.remove(os.path.join(self.dir, 'workout_series.csv'))
+        text = self._call('health_workout_detail', {'date': '2026-05-01', 'start': '07:00'})
+        self.assertIn('no minute-by-minute data at all', text)
+
     def test_detail_of_a_flagged_workout_says_so(self):
         text = self._call('health_workout_detail', {'date': '2026-05-01', 'start': '18:00'})
         self.assertIn('looks mis-recorded', text)
@@ -2072,8 +2094,21 @@ class TestMcpFreshness(unittest.TestCase):
                                       self.NOW)
         self.assertIn('not live', line)
 
-    def test_no_status_file_means_no_line(self):
-        self.assertEqual(health_mcp.status_line(self._data(None), self.NOW), '')
+    def test_a_build_without_a_status_file_says_its_age_is_unknown(self):
+        self.assertIn('not recorded', health_mcp.status_line(self._data(None), self.NOW))
+
+    def test_a_failed_rebuild_is_announced(self):
+        # current/ keeps the last good build when a rebuild fails; without this
+        # its answers look complete while everything synced since is missing.
+        out = tempfile.mkdtemp()
+        data = self._data(self.BRIDGE)
+        os.symlink(data.root, os.path.join(out, 'current'))
+        with open(os.path.join(out, 'sync_status.json'), 'w') as f:
+            json.dump({'ok': False, 'at': '2026-10-19T09:20:00+00:00', 'error': 'MemoryError'}, f)
+        line = health_mcp.status_line(HealthData(os.path.join(out, 'current')), self.NOW)
+        self.assertIn("last rebuild", line)
+        self.assertIn('failed: MemoryError', line)
+        self.assertIn('_Data:', line)
 
     def test_every_tool_answer_starts_with_it(self):
         reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
@@ -2413,6 +2448,15 @@ class TestHealthBridgeImport(unittest.TestCase):
         _data, _summary, days = self._load()
         self.assertEqual(float(days['2026-06-01']['spo2_avg']), 97.0)
 
+    def test_the_measuring_device_is_read_when_the_phone_sends_it(self):
+        self._sample('HKQuantityTypeIdentifierCyclingPower', 'cycling_power',
+                     '2026-06-01T17:00:00Z', '2026-06-01T17:00:01Z', 180.0, 'watts',
+                     healthkit_source_name='Apple Watch', healthkit_device_name='Domyos Bridge',
+                     sample_kind='raw_quantity')
+        data, _summary, _days = self._load()
+        power = [r for r in data.records if r.type == 'HKQuantityTypeIdentifierCyclingPower']
+        self.assertEqual((power[0].source_name, power[0].device), ('Apple Watch', 'Domyos Bridge'))
+
     def test_a_late_evening_sample_lands_on_the_local_day_not_the_utc_one(self):
         # 22:30 UTC on 1 June is 01:30 on 2 June in Vilnius. A receiver in a
         # container usually runs on UTC, so trusting the machine's zone would put
@@ -2668,9 +2712,15 @@ class TestHealthSync(unittest.TestCase):
     def test_a_failed_rebuild_keeps_serving_the_last_good_one(self):
         import health_sync
         good = health_sync.rebuild(self._args())
+        with open(os.path.join(self.out, 'sync_status.json')) as handle:
+            self.assertTrue(json.load(handle)['ok'])
         with open(self.db, 'wb') as handle:
             handle.write(b'not a database')
         self.assertIsNone(health_sync.rebuild(self._args()))
+        with open(os.path.join(self.out, 'sync_status.json')) as handle:
+            status = json.load(handle)
+        self.assertFalse(status['ok'])
+        self.assertIn('could not read', status['error'])
         self.assertEqual(health_sync.current_snapshot(self.out), good)
         self.assertEqual(health_sync.snapshot_names(os.path.join(self.out, 'snapshots')), [good])
 

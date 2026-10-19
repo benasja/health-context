@@ -148,20 +148,45 @@ The importer translates everything that differs in shape: UTC timestamps to
 your local day (using the timezone the phone reports, not the server's, which
 in a container is usually UTC), percentages sent as 0-100 to the fractions the
 export uses, the phone's de-duplicated daily totals in place of raw samples on
-days it sent one. With that done, the same synthetic two-and-a-half-year export
+days it sent one.
+
+That last one matters most. For summed metrics -- steps, energy, distance,
+exercise minutes -- the phone sends Apple's own daily total, already merged
+across iPhone and Watch, and may send the raw samples as well. Counting both
+would add the same walk twice. So for each metric and local day the phone's
+total is used if it sent one, and its raw samples for that day are skipped;
+days without a total fall back to the raw samples, de-duplicated across
+devices the same way as an export. The phone sends one total per metric per
+day and replaces it when it changes, and the receiver deletes records removed
+on the phone, so neither a corrected total nor a deleted workout is counted.
+This is the same rule the receiver's own daily summary uses.
+
+With that done, the same synthetic two-and-a-half-year export
 gives identical results by either route: every day, every score, every flag,
 every week, every workout. CI checks this on each change
 (`fixtures/check_bridge_equivalence.py`).
 
 What the app does not sync, and so cannot appear here:
 
-- **Stand hours.** A HealthKit type the app does not read.
+- **Stand hours** (the hourly ring). The app syncs stand *time* in minutes,
+  which comes through as `stand_minutes`, but not the stand-hour category
+  `stand_hours_met` is built from, so that column stays blank.
 - **Cycling power.** The same; the report's cycling power section is left out.
 - **Flights climbed on a day with none.** The app sends nothing rather than a
   zero, so the day reads as not measured.
 
 Sleep and workouts are labelled with the companion app as their source rather
 than the Watch. Only the label changes.
+
+## Which receiver versions work
+
+Tested against receiver **v1.1.2**, whose storage schema is unchanged on its
+current main. That is the tested baseline, not a promise: Health Bridge has no
+compatibility contract for programs that read its database directly, so a
+future release could change a table this reads. If it does, the importer
+refuses to run and names the table or column it could not find, rather than
+producing numbers from a layout it does not understand. Open an issue with
+that message and the receiver version.
 
 ## When it goes wrong
 

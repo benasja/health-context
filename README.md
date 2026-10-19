@@ -456,7 +456,8 @@ a manual tap. There are two ways around that.
 iPhone app that syncs Apple Health in the background to a receiver on a Mac or
 Linux machine you own. health-context reads the receiver's database directly —
 read-only, never touching its pairing or credential tables — and gives the same
-results as an export of the same data; CI checks that on every change.
+results as an export of the same data; CI checks that on every change. Tested
+with receiver v1.1.2.
 
 `health_sync.py` keeps the pack current from it, rebuilding whenever the phone
 has synced. A rebuild never replaces the data an open session is reading, and a

@@ -434,6 +434,10 @@ def workout_table(workouts: list[dict[str, str]]) -> str:
     return table(WORKOUT_HEADERS, [workout_row(w) for w in workouts])
 
 
+# How far after the hardest minute heart rate is looked for at its top.
+RECOVERY_LAG_MIN = 3
+
+
 def series_findings(minutes: list[dict[str, float | None]]) -> list[str]:
     """What the minute-by-minute numbers say that the averages don't.
 
@@ -463,8 +467,14 @@ def series_findings(minutes: list[dict[str, float | None]]) -> list[str]:
         hrs = [m['hr'] for m in minutes if m.get('hr')]
         if len(hrs) >= 10:
             half = len(hrs) // 2
-            why = (f'only {len(paired)} minutes have both heart rate and power, too few to '
-                   'judge drift at steady power' if paired else 'no power to compare against')
+            length = minutes[-1]['minute'] + 1
+            if not paired:
+                why = 'no power to compare against'
+            elif length < 20:
+                why = f'a {length}-minute ride is too short to judge drift; that needs 20 minutes or more'
+            else:
+                why = (f'only {len(paired)} of its minutes have both heart rate and power, too few '
+                       'to judge drift at steady power')
             findings.append(f'Heart rate averaged {mean(hrs[:half]):.0f} bpm in the first half and '
                             f'{mean(hrs[half:]):.0f} bpm in the second ({why}).')
 
@@ -473,16 +483,24 @@ def series_findings(minutes: list[dict[str, float | None]]) -> list[str]:
     peak = (max(with_power, key=lambda m: m['power']) if with_power
             else max((m for m in minutes if m.get('hr')), key=lambda m: m['hr'], default=None))
     if peak and peak.get('hr'):
-        after = [by_minute.get(peak['minute'] + k) for k in (1, 2)]
+        # Heart rate lags the effort: it tops out a minute or two after the
+        # hardest minute. Recovery counts from that top, not from the effort,
+        # or it reads heart rate still rising as a negative recovery.
+        top = max((by_minute[peak['minute'] + k] for k in range(RECOVERY_LAG_MIN + 1)
+                   if by_minute.get(peak['minute'] + k, {}).get('hr')), key=lambda m: m['hr'])
         label = f"{peak['power']:.0f} W, " if peak.get('power') else ''
         text = f"Hardest minute: minute {peak['minute']} ({label}{peak['hr']:.0f} bpm)."
+        if top is not peak:
+            text += f" Heart rate topped out at minute {top['minute']} ({top['hr']:.0f} bpm)."
+        after = [by_minute.get(top['minute'] + k) for k in (1, 2)]
         if after[0] and after[0].get('hr'):
-            text += f" One minute later {after[0]['hr']:.0f} bpm ({after[0]['hr'] - peak['hr']:+.0f})"
+            text += (f" From there, one minute later {after[0]['hr']:.0f} bpm "
+                     f"({after[0]['hr'] - top['hr']:+.0f})")
             if after[1] and after[1].get('hr'):
-                text += f", two minutes later {after[1]['hr']:.0f} bpm ({after[1]['hr'] - peak['hr']:+.0f})"
+                text += f", two minutes later {after[1]['hr']:.0f} bpm ({after[1]['hr'] - top['hr']:+.0f})"
             text += '. Minute averages, so the true recovery is a little faster than this shows.'
         else:
-            text += ' No heart rate recorded in the minute after it, so recovery can\'t be read.'
+            text += ' No heart rate recorded in the minute after that, so recovery can\'t be read.'
         findings.append(text)
     return findings
 

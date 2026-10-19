@@ -288,10 +288,14 @@ def write_data_status(out_dir: str, data: ExportData, source: str,
     Without it a reader can't tell a ride that is missing from one that hasn't
     synced yet, or a day's 4,900 steps from a day that isn't over.
     """
-    ends = [r.end for r in data.records] + [w.end for w in data.workouts]
+    built = datetime.now(tz.utc)
+    # A day's total from the phone spans to the coming midnight; its end is
+    # not a moment anything was measured, so it counts from its start.
+    ends = [r.end if r.end <= built else r.start for r in data.records]
+    ends += [w.end for w in data.workouts if w.end <= built]
     status = {
         'source': source,
-        'built_at': datetime.now(tz.utc).isoformat(timespec='seconds'),
+        'built_at': built.isoformat(timespec='seconds'),
         'latest_record': max(ends).isoformat(timespec='seconds') if ends else '',
         'latest_received': latest_received,
         'timezone': timezone,

@@ -1952,16 +1952,34 @@ class TestSeriesFindings(unittest.TestCase):
         text = health_mcp.series_findings(minutes_of([120.0] * 10 + [130.0] * 10, [None] * 20))[0]
         self.assertIn('120 bpm in the first half and 130 bpm', text)
 
-    def test_too_few_paired_minutes_says_so_rather_than_no_power(self):
-        text = health_mcp.series_findings(minutes_of([120.0] * 6 + [130.0] * 6, [150.0] * 12))[0]
-        self.assertIn('only 12 minutes have both', text)
+    def test_a_short_ride_is_called_too_short(self):
+        text = health_mcp.series_findings(minutes_of([120.0] * 8 + [130.0] * 8, [150.0] * 16))[0]
+        self.assertIn('a 16-minute ride is too short to judge drift', text)
+
+    def test_a_long_ride_with_few_paired_minutes_says_so(self):
+        text = health_mcp.series_findings(minutes_of([120.0] * 15 + [130.0] * 15,
+                                                     [150.0] * 12 + [None] * 18))[0]
+        self.assertIn('only 12 of its minutes have both', text)
 
     def test_recovery_after_the_hardest_minute(self):
         findings = health_mcp.series_findings(
             minutes_of([130.0, 170.0, 150.0, 135.0], [150.0, 400.0, 100.0, 100.0]))
         self.assertIn('minute 1 (400 W, 170 bpm)', findings[-1])
-        self.assertIn('One minute later 150 bpm (-20)', findings[-1])
+        self.assertNotIn('topped out', findings[-1])
+        self.assertIn('one minute later 150 bpm (-20)', findings[-1])
         self.assertIn('two minutes later 135 bpm (-35)', findings[-1])
+
+    def test_recovery_counts_from_where_heart_rate_topped_out(self):
+        # The sprint is minute 1 but heart rate peaks in minute 2; counting from
+        # the sprint read heart rate still rising as "+14 one minute later".
+        findings = health_mcp.series_findings(
+            minutes_of([137.0, 151.0, 142.0, 138.0], [312.0, 140.0, 130.0, 130.0]))
+        self.assertIn('Heart rate topped out at minute 1 (151 bpm)', findings[-1])
+        findings = health_mcp.series_findings(
+            minutes_of([130.0, 137.0, 151.0, 142.0, 138.0], [160.0, 312.0, 140.0, 130.0, 130.0]))
+        self.assertIn('topped out at minute 2 (151 bpm)', findings[-1])
+        self.assertIn('one minute later 142 bpm (-9)', findings[-1])
+        self.assertIn('two minutes later 138 bpm (-13)', findings[-1])
 
     def test_no_heart_rate_after_the_peak_is_said(self):
         findings = health_mcp.series_findings(minutes_of([130.0, 170.0], [150.0, 400.0]))
@@ -2087,6 +2105,24 @@ class TestMcpFreshness(unittest.TestCase):
         self.assertIn('Today (Mon 19 Oct) is still in progress', line)
         line = health_mcp.status_line(self._data(self.BRIDGE, days=('2026-10-18',)), self.NOW)
         self.assertNotIn('in progress', line)
+
+    def test_a_daily_total_running_to_midnight_is_not_the_newest_record(self):
+        import convert_health_data
+        now = datetime.now(timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        data = ExportData()
+        data.records = [
+            rec('HKQuantityTypeIdentifierHeartRate', 60, 'Apple Watch',
+                now - timedelta(minutes=30), now - timedelta(minutes=30)),
+            rec('HKQuantityTypeIdentifierStepCount', 4900, 'Daily total', midnight,
+                midnight + timedelta(days=1)),
+        ]
+        folder = tempfile.mkdtemp()
+        convert_health_data.write_data_status(folder, data, 'health_bridge')
+        with open(os.path.join(folder, 'data_status.json')) as f:
+            latest = datetime.fromisoformat(json.load(f)['latest_record'])
+        self.assertLessEqual(latest, now)
+        self.assertGreaterEqual(latest, now - timedelta(minutes=31))
 
     def test_an_export_says_it_is_not_live(self):
         line = health_mcp.status_line(self._data({'source': 'apple_export',

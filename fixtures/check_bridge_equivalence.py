@@ -36,22 +36,19 @@ ALLOWED_DAILY = {
     # The companion app attributes sleep sessions to itself rather than to the
     # Watch; the sleep numbers are unaffected, only this label changes.
     'sleep_source',
-    # Stand hours come from the AppleStandHour category, which the app does not
-    # sync (it sends stand time in minutes, which does come through).
-    'stand_hours_met',
 }
 ALLOWED_WORKOUT = {
     'workout_id',      # derived partly from the source name
     'source_name',     # same reason as sleep_source
-    'cycling_power_avg_w', 'cycling_power_max_w',   # power is not synced
 }
 # A day whose summed total is zero is not sent by the app at all, so the
 # export's explicit 0 reads as "not measured". (Real Apple exports also write
 # nothing on a day with no flights; the synthetic demo writes zeros.)
 ZERO_DROPPED = {'flights_climbed'}
 # Report sections that exist only because the export carries data the bridge
-# does not.
-ALLOWED_REPORT_SECTIONS = ('### Cycling power',)
+# does not. None, now that the fixture sends stand hours and cycling power; a
+# section that goes missing again is a regression.
+ALLOWED_REPORT_SECTIONS: tuple[str, ...] = ()
 
 
 def rows(path: str) -> list[dict[str, str]]:

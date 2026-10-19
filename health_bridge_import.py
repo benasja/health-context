@@ -50,6 +50,7 @@ from health_coaching import (
     SLEEP_IN_BED,
     SLEEP_REM,
     SLEEP_TYPE,
+    STAND_HOUR_TYPE,
     ExportData,
     Workout,
     add_parsed_record,
@@ -259,13 +260,30 @@ def resolve_timezone(conn: sqlite3.Connection, requested: str | None) -> tuple[t
                           "in a container on UTC, pass --timezone or every evening lands a day late")
 
 
+SPEED_TYPES = {'HKQuantityTypeIdentifierWalkingSpeed', 'HKQuantityTypeIdentifierCyclingSpeed'}
+
+# HKCategoryValueAppleStandHour as HealthKit numbers it. export.xml spells the
+# value out instead, and the stand-hour count only reads the spelling.
+STAND_HOUR_VALUES = {0: 'HKCategoryValueAppleStandHourStood', 1: 'HKCategoryValueAppleStandHourIdle'}
+
+
 def to_export_value(hk_type: str, value: float, unit: str) -> tuple[float, str]:
     """Convert a bridge value into the number and unit export.xml would hold."""
     if unit == '%':
         return value / 100.0, '%'
-    if hk_type == 'HKQuantityTypeIdentifierWalkingSpeed' and unit == 'm/s':
+    if hk_type in SPEED_TYPES and unit == 'm/s':
         return value * 3.6, 'km/hr'
     return value, UNIT_TO_EXPORT.get(unit, unit)
+
+
+def stand_hour_label(value: float) -> str | None:
+    """The export's label for a stand hour sent as HealthKit's number.
+
+    Passed through as a number it would read as "0.0" or "1.0", and the stand
+    count treats anything without "idle" in it as a stood hour: every idle hour
+    would count as stood. An unknown number is dropped rather than guessed.
+    """
+    return STAND_HOUR_VALUES.get(int(value)) if float(value).is_integer() else None
 
 
 def _stamp(dt: datetime) -> str:
@@ -356,13 +374,21 @@ def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],
                 summary.raw_replaced_by_daily_total += 1
                 continue
 
-        number, export_unit = to_export_value(hk, float(value), unit)
+        if hk == STAND_HOUR_TYPE:
+            label = stand_hour_label(float(value))
+            if label is None:
+                summary.unmapped_types[f'{type_code} value {value}'] += 1
+                continue
+            value_raw, export_unit = label, ''
+        else:
+            number, export_unit = to_export_value(hk, float(value), unit)
+            value_raw = repr(number)
         name = DAILY_TOTAL_SOURCE if daily else (meta.get('healthkit_source_name') or source)
         created_at = _stamp(parse_utc(created).astimezone(tz)) if created else ''
         if add_parsed_record(
             data, hk,
             start_raw=_stamp(start), end_raw=_stamp(end),
-            value_raw=repr(number), unit=export_unit,
+            value_raw=value_raw, unit=export_unit,
             source_name=str(name), creation=created_at,
             start_dt=start, end_dt=end,
         ):

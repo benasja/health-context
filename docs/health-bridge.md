@@ -166,14 +166,30 @@ gives identical results by either route: every day, every score, every flag,
 every week, every workout. CI checks this on each change
 (`fixtures/check_bridge_equivalence.py`).
 
-What the app does not sync, and so cannot appear here:
+What the Health Bridge app does not sync, and so cannot appear from it:
 
 - **Stand hours** (the hourly ring). The app syncs stand *time* in minutes,
   which comes through as `stand_minutes`, but not the stand-hour category
   `stand_hours_met` is built from, so that column stays blank.
-- **Cycling power.** The same; the report's cycling power section is left out.
+- **Cycling power, cadence and FTP.** The same; the report's cycling power
+  section is left out.
 - **Flights climbed on a day with none.** The app sends nothing rather than a
   zero, so the day reads as not measured.
+
+The receiver itself stores any type it is sent, so a client that does send
+these gets them included. They are read by their HealthKit identifier (the
+sample's `healthkit_identifier` metadata, or the type's alias), in these units:
+
+| HealthKit identifier | unit | value |
+|---|---|---|
+| `HKCategoryTypeIdentifierAppleStandHour` | `count` | HealthKit's number: 0 stood, 1 idle |
+| `HKQuantityTypeIdentifierCyclingPower` | `watts` | |
+| `HKQuantityTypeIdentifierCyclingCadence` | `count/min` | |
+| `HKQuantityTypeIdentifierCyclingSpeed` | `m/s` | converted to km/h |
+| `HKQuantityTypeIdentifierCyclingFunctionalThresholdPower` | `watts` | |
+
+The equivalence check sends all of them, so CI proves they arrive exactly as
+an export would have them: stand hours on every day, power on every ride.
 
 Sleep and workouts are labelled with the companion app as their source rather
 than the Watch. Only the label changes.

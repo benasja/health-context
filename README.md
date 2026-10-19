@@ -497,7 +497,7 @@ answering from old numbers.
 ## Development
 
 ```bash
-python3 test_health.py                  # 265 tests, stdlib only
+python3 test_health.py                  # 268 tests, stdlib only
 pip install ruff && ruff check .
 ```
 

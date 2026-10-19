@@ -36,7 +36,8 @@ ALLOWED_DAILY = {
     # The companion app attributes sleep sessions to itself rather than to the
     # Watch; the sleep numbers are unaffected, only this label changes.
     'sleep_source',
-    # Stand hours come from a HealthKit category type the app does not sync.
+    # Stand hours come from the AppleStandHour category, which the app does not
+    # sync (it sends stand time in minutes, which does come through).
     'stand_hours_met',
 }
 ALLOWED_WORKOUT = {

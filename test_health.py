@@ -2215,6 +2215,54 @@ class TestHealthBridgeImport(unittest.TestCase):
         _data, _summary, days = self._load()
         self.assertAlmostEqual(float(days['2026-06-01']['walking_speed_kmh']), 4.5, places=6)
 
+    def test_a_stand_hour_sent_as_healthkits_number_counts_only_when_stood(self):
+        # HealthKit numbers the category 0 for stood and 1 for idle. Passed
+        # through as "1.0", an idle hour would have counted as stood, because
+        # the stand count only looks for "idle" in the export's label.
+        for minute, value in (('08', 0), ('09', 0), ('10', 1), ('11', 7)):
+            self._sample('HKCategoryTypeIdentifierAppleStandHour', 'stand_hour',
+                         f'2026-06-01T{minute}:00:00Z', f'2026-06-01T{minute}:59:59Z', value, 'count',
+                         healthkit_source_name='Apple Watch', sample_kind='raw_category')
+        _data, summary, days = self._load()
+        self.assertEqual(int(days['2026-06-01']['stand_hours_met']), 2)
+        # An unknown number is reported, not guessed into either answer.
+        self.assertIn('stand_hour value 7.0', summary.unmapped_types)
+
+    def test_bike_power_and_cadence_reach_the_ride_they_were_recorded_in(self):
+        import sqlite3
+        for minute, watts, rpm in (('10', 200.0, 85.0), ('20', 230.0, 91.0)):
+            self._sample('HKQuantityTypeIdentifierCyclingPower', 'cycling_power',
+                         f'2026-06-01T15:{minute}:00Z', f'2026-06-01T15:{minute}:01Z', watts, 'watts',
+                         healthkit_source_name='Wahoo KICKR', sample_kind='raw_quantity')
+            self._sample('HKQuantityTypeIdentifierCyclingCadence', 'cycling_cadence',
+                         f'2026-06-01T15:{minute}:00Z', f'2026-06-01T15:{minute}:01Z', rpm, 'count/min',
+                         healthkit_source_name='Wahoo KICKR', sample_kind='raw_quantity')
+        # Outside the ride: must not count towards it.
+        self._sample('HKQuantityTypeIdentifierCyclingPower', 'cycling_power',
+                     '2026-06-01T18:00:00Z', '2026-06-01T18:00:01Z', 900.0, 'watts',
+                     healthkit_source_name='Wahoo KICKR', sample_kind='raw_quantity')
+        self._sample('HKQuantityTypeIdentifierCyclingFunctionalThresholdPower', 'cycling_functional_threshold_power',
+                     '2026-06-01T07:00:00Z', '2026-06-01T07:00:00Z', 250.0, 'watts',
+                     healthkit_source_name='Wahoo', sample_kind='raw_quantity')
+        conn = sqlite3.connect(self.db)
+        conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
+                     "duration_seconds, energy_kcal, distance_meters) values "
+                     "(1, 'r1', 'cycling', '2026-06-01T15:00:00Z', '2026-06-01T16:00:00Z', 3600, 600.0, 30000.0)")
+        conn.commit()
+        conn.close()
+        data, _summary, days = self._load()
+        ride = next(r for r in build_workout_summary(data) if 'Cycling' in r['activity_type'])
+        self.assertEqual(ride['cycling_power_avg_w'], 215.0)
+        self.assertEqual(ride['cycling_power_max_w'], 230.0)
+        self.assertEqual(ride['cycling_cadence_avg_rpm'], 88.0)
+        self.assertEqual(float(days['2026-06-01']['cycling_ftp_w']), 250.0)
+
+    def test_cycling_speed_in_metres_per_second_becomes_kmh(self):
+        import health_bridge_import
+        value, unit = health_bridge_import.to_export_value('HKQuantityTypeIdentifierCyclingSpeed', 8.0, 'm/s')
+        self.assertAlmostEqual(value, 28.8, places=6)
+        self.assertEqual(unit, 'km/hr')
+
     def test_sleep_stages_map_onto_apples_and_a_stageless_session_is_only_in_bed(self):
         import sqlite3
         conn = sqlite3.connect(self.db)

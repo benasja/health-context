@@ -15,9 +15,11 @@ them -- because the differences are the whole point of the importer:
 * sleep as sessions holding stage intervals, attributed to the phone app;
 * the original device kept in `healthkit_source_name`, as the app does.
 
-Types the companion app does not sync (stand-hour categories, cycling power)
-are left out, so a comparison against export.xml also shows what an export
-carries that the bridge does not.
+Stand hours and the cycling types (power, cadence, speed, FTP) are included
+too. The Health Bridge app does not send them, but the receiver stores them
+from any client that does, so this covers a client that sends everything:
+stand hours as HealthKit's category number (0 stood, 1 idle), power in
+"watts", speed in m/s.
 
 By default the database gets a minimal schema covering only what the importer
 reads. `--schema-dir` applies a real receiver's SQL migrations instead, which
@@ -80,7 +82,7 @@ Q = 'HKQuantityTypeIdentifier'
 # HealthKit identifier -> (bridge type code, bridge unit, category, aggregation).
 TYPES = {
     Q + 'StepCount': ('steps', 'count', 'activity', 'sum'),
-    Q + 'ActiveEnergyBurned': ('active_energy', 'kcal', 'activity', 'sum'),
+    Q + 'ActiveEnergyBurned': ('energy', 'kcal', 'activity', 'sum'),
     Q + 'BasalEnergyBurned': ('basal_energy', 'kcal', 'activity', 'sum'),
     Q + 'DistanceWalkingRunning': ('distance_walking_running', 'm', 'activity', 'sum'),
     Q + 'FlightsClimbed': ('flights_climbed', 'count', 'activity', 'sum'),
@@ -92,10 +94,15 @@ TYPES = {
     Q + 'RespiratoryRate': ('respiratory_rate', 'brpm', 'vitals', 'minMaxAverage'),
     Q + 'OxygenSaturation': ('oxygen_saturation', '%', 'vitals', 'minMaxAverage'),
     Q + 'AppleSleepingWristTemperature': ('skin_temperature', '°C', 'vitals', 'minMaxAverage'),
-    Q + 'BodyMass': ('body_mass', 'kg', 'body', 'latest'),
+    Q + 'BodyMass': ('weight', 'kg', 'body', 'latest'),
     Q + 'BodyFatPercentage': ('body_fat_percentage', '%', 'body', 'latest'),
     Q + 'VO2Max': ('vo2_max', 'mL/kg/min', 'fitness', 'latest'),
+    Q + 'CyclingPower': ('cycling_power', 'watts', 'fitness', 'minMaxAverage'),
+    Q + 'CyclingCadence': ('cycling_cadence', 'count/min', 'fitness', 'minMaxAverage'),
+    Q + 'CyclingSpeed': ('cycling_speed', 'm/s', 'fitness', 'minMaxAverage'),
+    Q + 'CyclingFunctionalThresholdPower': ('cycling_functional_threshold_power', 'watts', 'fitness', 'latest'),
 }
+STAND_HOUR = 'HKCategoryTypeIdentifierAppleStandHour'
 DAILY_TOTAL_TYPES = {hk for hk, (_c, _u, _cat, agg) in TYPES.items() if agg == 'sum'}
 # Raw samples are also sent for these, alongside the daily total.
 ALSO_RAW = {Q + 'StepCount'}
@@ -120,6 +127,8 @@ def to_bridge_value(hk: str, value: float, unit: str) -> float:
         return value * 100.0
     if bridge_unit == 'm' and unit.lower() == 'km':
         return value * 1000.0
+    if bridge_unit == 'm/s' and unit.lower() == 'km/hr':
+        return value / 3.6
     return value
 
 
@@ -150,6 +159,9 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
                      'default_unit, sensitivity) values (?, ?, ?, ?, ?)',
                      (code, code.replace('_', ' ').title(), category, unit, 'moderate'))
         conn.execute('insert into health_type_aliases (type_code, alias) values (?, ?)', (code, hk))
+    conn.execute("insert or ignore into health_types (type_code, display_name, category, default_unit, "
+                 "sensitivity) values ('stand_hour', 'Stand Hour', 'activity', 'count', 'moderate')")
+    conn.execute("insert into health_type_aliases (type_code, alias) values ('stand_hour', ?)", (STAND_HOUR,))
 
     counts = defaultdict(int)
     serial = 0
@@ -207,6 +219,19 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
                 'healthkit_object_kind': 'quantity', 'healthkit_query': 'HKAnchoredObjectQuery',
                 'healthkit_source_name': source_name, 'sample_kind': 'raw_quantity'})
         counts['raw_samples'] += 1
+
+    # Stand hours: a category, so HealthKit's number rather than the export's label.
+    for start, end, label, source_name in _stand_hours(export_xml):
+        serial += 1
+        conn.execute('insert into samples (source_id, type_code, client_record_id, start_time, '
+                     'end_time, value, unit, metadata_json) values (?, ?, ?, ?, ?, ?, ?, ?)',
+                     (source_id, 'stand_hour', f'fixture-{serial}', utc(start), utc(end),
+                      1 if 'idle' in label.lower() else 0, 'count',
+                      json.dumps({'healthkit_identifier': STAND_HOUR, 'healthkit_object_kind': 'category',
+                                  'healthkit_query': 'HKAnchoredObjectQuery',
+                                  'healthkit_source_name': source_name, 'sample_kind': 'raw_category'},
+                                 sort_keys=True)))
+        counts['stand_hours'] += 1
 
     # Sleep: sessions of contiguous stage records from one device.
     by_source = defaultdict(list)
@@ -267,6 +292,21 @@ def _all_raw(export_xml: str):
             if value is not None and start and end:
                 yield start, end, value, elem.get('unit', '') or '', elem.get('type', ''), \
                     elem.get('sourceName', '') or ''
+            elem.clear()
+
+
+def _stand_hours(export_xml: str):
+    """Every AppleStandHour record: its times, its label, its source."""
+    import xml.etree.ElementTree as ET
+
+    from health_coaching import parse_health_datetime
+    for _event, elem in ET.iterparse(export_xml, events=('end',)):
+        if elem.tag == 'Record' and elem.get('type') == STAND_HOUR:
+            start = parse_health_datetime(elem.get('startDate', ''))
+            end = parse_health_datetime(elem.get('endDate', ''))
+            if start and end:
+                yield start, end, elem.get('value', '') or '', elem.get('sourceName', '') or ''
+        if elem.tag == 'Record':
             elem.clear()
 
 

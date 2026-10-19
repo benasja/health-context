@@ -140,6 +140,9 @@ class BridgeSummary:
     workouts: int = 0
     unmapped_types: Counter = field(default_factory=Counter)
     not_parsed_types: Counter = field(default_factory=Counter)
+    # When the receiver last stored something from the phone (UTC, ISO), so a
+    # reader can tell "not synced yet" from "not recorded".
+    latest_received: str = ''
 
 
 def open_readonly(path: str) -> sqlite3.Connection:
@@ -301,6 +304,7 @@ def load_into(data: ExportData, db_path: str, timezone_name: str | None = None) 
         _load_samples(conn, data, tz, aliases, summary)
         _load_sleep(conn, data, tz, summary)
         _load_workouts(conn, data, tz, summary)
+        summary.latest_received = _latest_received(conn)
         data.timezone_label = tz_name
         return summary
     finally:
@@ -331,6 +335,15 @@ def _local_day_span(meta: dict, start: datetime, end: datetime, tz: tzinfo) -> t
         except ValueError:
             pass
     return start.astimezone(tz), end.astimezone(tz)
+
+
+def _latest_received(conn: sqlite3.Connection) -> str:
+    stamps = [conn.execute(f'select max(created_at) from {table}').fetchone()[0]
+              for table in ('samples', 'workouts', 'sleep_sessions')]
+    stamps = [s for s in stamps if s]
+    if not stamps:
+        return ''
+    return max(parse_utc(s) for s in stamps).isoformat()
 
 
 def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],

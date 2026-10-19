@@ -24,7 +24,7 @@ import json
 import os
 import statistics
 import sys
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 from collections.abc import Callable
 
@@ -95,12 +95,14 @@ class HealthData:
         'insights': 'daily_insights.csv',
         'weekly': 'weekly_summary.csv',
         'workouts': 'workout_summary.csv',
+        'series': 'workout_series.csv',
         'coverage': 'metric_coverage.csv',
     }
     DOCS = {
         'context': 'llm_context.md',
         'report': 'insights_report.md',
         'quality': 'data_quality_report.txt',
+        'status': 'data_status.json',
     }
 
     def __init__(self, data_dir: str):
@@ -300,6 +302,170 @@ def describe(values: list[float]) -> str:
     if len(values) > 1:
         body.append(f'- stdev: {fmt(statistics.pstdev(values))}')
     return '\n'.join(body)
+
+
+# ---------------------------------------------------------------------------
+# Freshness: said on every answer
+# ---------------------------------------------------------------------------
+
+def data_status(data: HealthData) -> dict[str, Any]:
+    try:
+        return json.loads(data.doc('status') or '{}')
+    except ValueError:
+        return {}
+
+
+def _local_now(status: dict[str, Any], now: datetime | None = None) -> datetime:
+    zone = None
+    if status.get('timezone'):
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(status['timezone'])
+        except Exception:  # noqa: BLE001 - unknown zone: fall back to the machine's
+            zone = None
+    now = now or datetime.now().astimezone()
+    return now.astimezone(zone) if zone else now.astimezone()
+
+
+def _when(raw: str, now: datetime) -> str:
+    """'22:41' if today, else '2026-10-18 22:41', in the data's time zone."""
+    try:
+        moment = datetime.fromisoformat(raw).astimezone(now.tzinfo)
+    except (TypeError, ValueError):
+        return ''
+    return moment.strftime('%H:%M') if moment.date() == now.date() else moment.strftime('%Y-%m-%d %H:%M')
+
+
+def status_line(data: HealthData, now: datetime | None = None) -> str:
+    """One line on how fresh the data is, put above every tool answer.
+
+    Without it a missing ride and a ride that hasn't synced yet look the same,
+    and so do a finished day and one still under way.
+    """
+    status = data_status(data)
+    if not status:
+        return ''
+    now = _local_now(status, now)
+    parts = []
+    if status.get('source') == 'health_bridge':
+        if status.get('latest_received'):
+            parts.append(f"phone last synced {_when(status['latest_received'], now)}")
+        if status.get('latest_record'):
+            parts.append(f"newest record {_when(status['latest_record'], now)}")
+        if status.get('built_at'):
+            parts.append(f"rebuilt {_when(status['built_at'], now)}")
+        if status.get('check_interval_s'):
+            parts.append(f"the server checks for new data every {round(status['check_interval_s'] / 60)} min")
+    else:
+        parts.append('from an Apple Health export, not live')
+        if status.get('latest_record'):
+            parts.append(f"newest record {_when(status['latest_record'], now)}")
+    line = 'Data: ' + '; '.join(parts) + '.'
+    today = now.date().isoformat()
+    if any(r.get('date') == today for r in data.table('daily')):
+        line += (f" Today ({now:%a %d %b}) is still in progress: its totals are "
+                 'partial, not final.')
+    return f'_{line}_'
+
+
+def is_today(data: HealthData, day: date, now: datetime | None = None) -> bool:
+    return _local_now(data_status(data), now).date() == day
+
+
+# ---------------------------------------------------------------------------
+# Workouts: one layout everywhere
+# ---------------------------------------------------------------------------
+
+WORKOUT_HEADERS = ['date', 'time', 'activity', 'min', 'avg HR', 'max HR',
+                   'HR zone min z1/z2/z3/z4/z5', 'avg W', 'max W', 'rpm',
+                   'HR / power from', 'flag']
+
+
+def _clock(raw: str) -> str:
+    """'2026-10-19 22:23:00 +0300' -> '22:23' (local time as recorded)."""
+    parts = (raw or '').split(' ')
+    return parts[1][:5] if len(parts) > 1 else ''
+
+
+def _zones(w: dict[str, str]) -> str:
+    values = [to_float(w.get(f'hr_zone_z{i}_min')) for i in range(1, 6)]
+    if not any(v for v in values if v):
+        return ''
+    return '/'.join(str(round(v)) if v else '0' for v in values)
+
+
+def _sources(w: dict[str, str]) -> str:
+    hr, power = w.get('hr_source', ''), w.get('power_source', '')
+    if hr and power and hr != power:
+        return f'{hr} / {power}'
+    return hr or power or w.get('source_name', '')
+
+
+def workout_row(w: dict[str, str]) -> list[str]:
+    return [w.get('date', ''),
+            f"{_clock(w.get('start_datetime', ''))}–{_clock(w.get('end_datetime', ''))}",
+            w.get('activity_type', ''), fmt(to_float(w.get('duration_min')), 0),
+            w.get('avg_heart_rate_bpm', ''), w.get('max_heart_rate_bpm', ''), _zones(w),
+            w.get('cycling_power_avg_w', ''), w.get('cycling_power_max_w', ''),
+            w.get('cycling_cadence_avg_rpm', ''), _sources(w),
+            ('suspicious: ' + w['quality_flag']) if w.get('quality_flag') else '']
+
+
+def workout_table(workouts: list[dict[str, str]]) -> str:
+    return table(WORKOUT_HEADERS, [workout_row(w) for w in workouts])
+
+
+def series_findings(minutes: list[dict[str, float | None]]) -> list[str]:
+    """What the minute-by-minute numbers say that the averages don't.
+
+    `minutes`: dicts with minute, hr, power (either may be None), in order.
+    """
+    def mean(values):
+        return statistics.mean(values) if values else None
+
+    findings = []
+    paired = [(m['hr'], m['power']) for m in minutes if m.get('hr') and m.get('power')]
+    if len(paired) >= 20:
+        half = len(paired) // 2
+        first, second = paired[:half], paired[half:]
+        p1, p2 = mean([p for _h, p in first]), mean([p for _h, p in second])
+        h1, h2 = mean([h for h, _p in first]), mean([h for h, _p in second])
+        decoupling = ((p1 / h1) - (p2 / h2)) / (p1 / h1) * 100
+        powers = [p for _h, p in paired]
+        cv = statistics.pstdev(powers) / statistics.mean(powers)
+        text = (f'Heart-rate drift at steady power (aerobic decoupling): {decoupling:+.1f}%. '
+                f'First half {p1:.0f} W at {h1:.0f} bpm, second half {p2:.0f} W at {h2:.0f} bpm. '
+                'Under about 5% means heart rate held at the same power; above it, it '
+                'climbed (fatigue, heat or too little fuel or water).')
+        if cv > 0.2:
+            text += f' Power varied a lot (CV {cv * 100:.0f}%), so treat this loosely.'
+        findings.append(text)
+    else:
+        hrs = [m['hr'] for m in minutes if m.get('hr')]
+        if len(hrs) >= 10:
+            half = len(hrs) // 2
+            why = (f'only {len(paired)} minutes have both heart rate and power, too few to '
+                   'judge drift at steady power' if paired else 'no power to compare against')
+            findings.append(f'Heart rate averaged {mean(hrs[:half]):.0f} bpm in the first half and '
+                            f'{mean(hrs[half:]):.0f} bpm in the second ({why}).')
+
+    by_minute = {m['minute']: m for m in minutes}
+    with_power = [m for m in minutes if m.get('power')]
+    peak = (max(with_power, key=lambda m: m['power']) if with_power
+            else max((m for m in minutes if m.get('hr')), key=lambda m: m['hr'], default=None))
+    if peak and peak.get('hr'):
+        after = [by_minute.get(peak['minute'] + k) for k in (1, 2)]
+        label = f"{peak['power']:.0f} W, " if peak.get('power') else ''
+        text = f"Hardest minute: minute {peak['minute']} ({label}{peak['hr']:.0f} bpm)."
+        if after[0] and after[0].get('hr'):
+            text += f" One minute later {after[0]['hr']:.0f} bpm ({after[0]['hr'] - peak['hr']:+.0f})"
+            if after[1] and after[1].get('hr'):
+                text += f", two minutes later {after[1]['hr']:.0f} bpm ({after[1]['hr'] - peak['hr']:+.0f})"
+            text += '. Minute averages, so the true recovery is a little faster than this shows.'
+        else:
+            text += ' No heart rate recorded in the minute after it, so recovery can\'t be read.'
+        findings.append(text)
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +676,10 @@ def _day_detail(data: HealthData, args: dict[str, Any]) -> str:
         return f'No row for {target.isoformat()}. The export may not cover that date.'
 
     filled = [(k, v) for k, v in row.items() if v not in ('', None) and k != 'date']
-    lines = [f'# {target.isoformat()} ({target.strftime("%A")})', '']
+    heading = f'# {target.isoformat()} ({target.strftime("%A")})'
+    if is_today(data, target):
+        heading += ' — in progress, totals so far'
+    lines = [heading, '']
     lines.append(table(['field', 'value'], [[k, str(v)] for k, v in filled]))
 
     insight = next((r for r in data.table('insights')
@@ -525,11 +694,8 @@ def _day_detail(data: HealthData, args: dict[str, Any]) -> str:
 
     workouts = [w for w in data.table('workouts') if w.get('date') == target.isoformat()]
     if workouts:
-        lines += ['', '## Workouts', '',
-                  table(['activity', 'min', 'kcal', 'avg HR', 'max HR'],
-                        [[w.get('activity_type', ''), w.get('duration_min', ''),
-                          w.get('total_energy_kcal', ''), w.get('avg_heart_rate_bpm', ''),
-                          w.get('max_heart_rate_bpm', '')] for w in workouts])]
+        lines += ['', '## Workouts', '', workout_table(workouts),
+                  '', 'Minute by minute: health_workout_detail with this date.']
     return '\n'.join(lines)
 
 
@@ -616,11 +782,72 @@ def _workouts(data: HealthData, args: dict[str, Any]) -> str:
                 + table(['activity', 'sessions', 'total min', 'mean min'], rows))
 
     shown = picked[-MAX_ROWS:]
-    rows = [[w['date'], w.get('activity_type', ''), w.get('duration_min', ''),
-             w.get('total_energy_kcal', ''), w.get('avg_heart_rate_bpm', ''),
-             w.get('cycling_power_avg_w', '')] for w in shown]
-    return (f'**{len(picked)} workouts**, showing last {len(shown)}\n\n'
-            + table(['date', 'activity', 'min', 'kcal', 'avg HR', 'avg W'], rows))
+    flagged = sum(1 for w in picked if w.get('quality_flag'))
+    note = (f' {flagged} look mis-recorded (see the flag column); leave them out of '
+            'comparisons.' if flagged else '')
+    return (f'**{len(picked)} workouts**, showing last {len(shown)}.{note}\n\n'
+            + workout_table(shown))
+
+
+@tool(
+    'health_workout_detail',
+    'One workout minute by minute: heart rate, power and cadence, plus heart-rate drift '
+    'at steady power (aerobic decoupling, a sign of fatigue) and how fast heart rate '
+    'came down after the hardest minute. Give the date; if that day had more than one '
+    'workout, also its start time.',
+    obj({'date': DATE_PROP,
+         'start': {'type': 'string', 'description': 'Start time HH:MM, when the day had several workouts'}},
+        ['date']),
+)
+def _workout_detail(data: HealthData, args: dict[str, Any]) -> str:
+    target = parse_date(args['date'])
+    day = [w for w in data.table('workouts') if w.get('date') == target.isoformat()]
+    if not day:
+        return f'No workouts on {target.isoformat()}.'
+    start = (args.get('start') or '').strip()
+    picked = [w for w in day if start and _clock(w.get('start_datetime', '')) == start]
+    if not picked and len(day) == 1 and not start:
+        picked = day
+    if not picked:
+        return (f'{len(day)} workouts on {target.isoformat()}; say which by its start time.\n\n'
+                + workout_table(day))
+    w = picked[0]
+
+    lines = [workout_table([w])]
+    if w.get('quality_flag'):
+        lines += ['', f"This workout looks mis-recorded ({w['quality_flag']}); its numbers may not be real."]
+    rows = [r for r in data.table('series') if r.get('workout_id') == w.get('workout_id')]
+    if not rows:
+        return '\n'.join(lines + ['', 'No heart-rate or power samples were recorded inside this workout.'])
+
+    minutes = [{'minute': int(r['minute']), 'hr': to_float(r.get('hr_avg_bpm')),
+                'hr_max': to_float(r.get('hr_max_bpm')), 'power': to_float(r.get('power_avg_w')),
+                'power_max': to_float(r.get('power_max_w')),
+                'cadence': to_float(r.get('cadence_avg_rpm'))} for r in rows]
+    findings = series_findings(minutes)
+    if findings:
+        lines += [''] + [f'- {f}' for f in findings]
+
+    # One row per minute up to an hour and a half; five-minute blocks beyond, so a
+    # long ride still fits in one answer.
+    step = 1 if minutes[-1]['minute'] <= 90 else 5
+    blocks: dict[int, list[dict[str, Any]]] = {}
+    for m in minutes:
+        blocks.setdefault(m['minute'] // step * step, []).append(m)
+
+    def avg(ms, key):
+        vals = [m[key] for m in ms if m.get(key) is not None]
+        return fmt(statistics.mean(vals), 0) if vals else ''
+
+    def peak(ms, key):
+        vals = [m[key] for m in ms if m.get(key) is not None]
+        return fmt(max(vals), 0) if vals else ''
+
+    table_rows = [[str(b), avg(ms, 'hr'), peak(ms, 'hr_max'), avg(ms, 'power'), peak(ms, 'power_max'),
+                   avg(ms, 'cadence')] for b, ms in sorted(blocks.items())]
+    label = 'minute' if step == 1 else 'from minute (5-min blocks)'
+    lines += ['', table([label, 'avg HR', 'max HR', 'avg W', 'max W', 'rpm'], table_rows)]
+    return '\n'.join(lines)
 
 
 @tool(
@@ -810,6 +1037,11 @@ def handle(message: dict[str, Any], data: HealthData) -> dict[str, Any] | None:
                 'content': [{'type': 'text', 'text': f'{name} failed: {exc}'}],
                 'isError': True,
             })
+        # Every answer says how fresh the data is, so "missing" and "not synced
+        # yet" are never confused.
+        status = status_line(data)
+        if status:
+            text = f'{status}\n\n{text}'
         # Capped here rather than in each tool: a new tool would otherwise be one
         # oversight away from flooding a small context window.
         return make_result(request_id, {'content': [{'type': 'text',

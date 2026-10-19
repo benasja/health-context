@@ -29,6 +29,7 @@ from health_coaching import (
     Workout,
     aggregate_sleep_by_day,
     build_daily_metrics,
+    build_workout_series,
     build_workout_summary,
     compute_workout_hr_zones,
     dedup_interval_sum,
@@ -44,6 +45,7 @@ from health_coaching import (
     overlap_minutes,
     resolve_max_hr,
     source_priority,
+    workout_quality_flag,
 )
 from health_history import (
     METRICS_BY_COLUMN,
@@ -1825,6 +1827,261 @@ body three
         self.assertEqual(health_mcp.markdown_sections(''), {})
 
 
+def _zone_available(name: str) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:  # noqa: BLE001 -- any failure means "no tz database here"
+        return False
+
+
+class TestWorkoutQualityFlag(unittest.TestCase):
+    """Records that look mis-recorded are flagged, never dropped: a 12-hour
+    ride with no heart rate would otherwise sit in every total as if real."""
+
+    def test_hours_without_heart_rate_are_flagged(self):
+        flag = workout_quality_flag({'activity_type': 'Cycling', 'duration_min': 540.0,
+                                     'avg_heart_rate_bpm': ''})
+        self.assertIn('9.0 h with no heart rate', flag)
+
+    def test_a_long_ride_with_heart_rate_is_not(self):
+        self.assertEqual(workout_quality_flag({'activity_type': 'Cycling', 'duration_min': 300.0,
+                                               'avg_heart_rate_bpm': 128.0}), '')
+
+    def test_a_short_session_without_heart_rate_is_not(self):
+        # Plenty of real workouts are logged by hand or by a phone alone.
+        self.assertEqual(workout_quality_flag({'activity_type': 'Walking', 'duration_min': 45.0,
+                                               'avg_heart_rate_bpm': ''}), '')
+
+    def test_an_impossible_average_speed_is_flagged(self):
+        flag = workout_quality_flag({'activity_type': 'Cycling', 'duration_min': 30.0,
+                                     'distance_km': 60.0, 'avg_heart_rate_bpm': 140.0})
+        self.assertIn('average 120 km/h', flag)
+
+    def test_a_normal_ride_is_not_flagged(self):
+        self.assertEqual(workout_quality_flag({'activity_type': 'Outdoor Cycling', 'duration_min': 90.0,
+                                               'distance_km': 40.0, 'avg_heart_rate_bpm': 140.0}), '')
+
+    def test_reasons_are_combined(self):
+        flag = workout_quality_flag({'activity_type': 'Cycling', 'duration_min': 17 * 60.0,
+                                     'avg_heart_rate_bpm': ''})
+        self.assertIn('no heart rate', flag)
+        self.assertIn('longer than 16 h', flag)
+
+
+class TestWorkoutSeries(unittest.TestCase):
+    def _ride(self):
+        start, end = dt(2026, 5, 1, 17, 0), dt(2026, 5, 1, 17, 3)
+        return Workout(
+            workout_activity_type='HKWorkoutActivityTypeCycling', start=start, end=end,
+            start_raw=start.isoformat(), end_raw=end.isoformat(), creation='',
+            duration=3.0, duration_unit='min', total_energy=None, total_energy_unit='kcal',
+            total_distance=None, total_distance_unit='km', source_name='Apple Watch',
+        )
+
+    def _data(self):
+        data = ExportData()
+        data.workouts = [self._ride()]
+        base = dt(2026, 5, 1, 17, 0)
+        for second, bpm, watts in ((0, 120, 150), (30, 124, 160), (70, 140, 300), (130, 130, 100)):
+            at = base + timedelta(seconds=second)
+            data.records.append(rec('HKQuantityTypeIdentifierHeartRate', bpm, 'Apple Watch',
+                                    at, at, unit='count/min'))
+            data.records.append(rec('HKQuantityTypeIdentifierCyclingPower', watts, 'Wahoo KICKR',
+                                    at, at, unit='W'))
+        # Outside the workout: must not count.
+        late = dt(2026, 5, 1, 17, 10)
+        data.records.append(rec('HKQuantityTypeIdentifierHeartRate', 90, 'Apple Watch',
+                                late, late, unit='count/min'))
+        return data
+
+    def test_samples_are_grouped_by_minute_of_the_workout(self):
+        rows = build_workout_series(self._data())
+        self.assertEqual([r['minute'] for r in rows], [0, 1, 2])
+        self.assertAlmostEqual(rows[0]['hr_avg_bpm'], 122.0)
+        self.assertAlmostEqual(rows[0]['hr_max_bpm'], 124.0)
+        self.assertAlmostEqual(rows[0]['power_avg_w'], 155.0)
+        self.assertAlmostEqual(rows[1]['power_max_w'], 300.0)
+        self.assertEqual(rows[0]['cadence_avg_rpm'], '')
+
+    def test_the_summary_names_which_device_recorded_what(self):
+        row = build_workout_summary(self._data())[0]
+        self.assertEqual(row['hr_source'], 'Apple Watch')
+        self.assertEqual(row['power_source'], 'Wahoo KICKR')
+        self.assertEqual(row['quality_flag'], '')
+
+
+def minutes_of(hr, power):
+    return [{'minute': i, 'hr': h, 'power': p} for i, (h, p) in enumerate(zip(hr, power, strict=True))]
+
+
+class TestSeriesFindings(unittest.TestCase):
+    def test_heart_rate_climbing_at_steady_power_is_positive_decoupling(self):
+        text = health_mcp.series_findings(minutes_of([130.0] * 20 + [140.0] * 20, [150.0] * 40))[0]
+        # (150/130 - 150/140) / (150/130) = 7.1%
+        self.assertIn('+7.1%', text)
+        self.assertNotIn('treat this loosely', text)
+
+    def test_steady_heart_rate_is_no_drift(self):
+        text = health_mcp.series_findings(minutes_of([135.0] * 30, [150.0] * 30))[0]
+        self.assertIn('+0.0%', text)
+
+    def test_uneven_power_is_caveated(self):
+        text = health_mcp.series_findings(minutes_of([135.0] * 30, [50.0, 300.0] * 15))[0]
+        self.assertIn('treat this loosely', text)
+
+    def test_without_power_it_compares_heart_rate_halves(self):
+        text = health_mcp.series_findings(minutes_of([120.0] * 10 + [130.0] * 10, [None] * 20))[0]
+        self.assertIn('120 bpm in the first half and 130 bpm', text)
+
+    def test_too_few_paired_minutes_says_so_rather_than_no_power(self):
+        text = health_mcp.series_findings(minutes_of([120.0] * 6 + [130.0] * 6, [150.0] * 12))[0]
+        self.assertIn('only 12 minutes have both', text)
+
+    def test_recovery_after_the_hardest_minute(self):
+        findings = health_mcp.series_findings(
+            minutes_of([130.0, 170.0, 150.0, 135.0], [150.0, 400.0, 100.0, 100.0]))
+        self.assertIn('minute 1 (400 W, 170 bpm)', findings[-1])
+        self.assertIn('One minute later 150 bpm (-20)', findings[-1])
+        self.assertIn('two minutes later 135 bpm (-35)', findings[-1])
+
+    def test_no_heart_rate_after_the_peak_is_said(self):
+        findings = health_mcp.series_findings(minutes_of([130.0, 170.0], [150.0, 400.0]))
+        self.assertIn("recovery can't be read", findings[-1])
+
+
+WORKOUT_FIELDS = ['workout_id', 'activity_type', 'date', 'start_datetime', 'end_datetime',
+                  'duration_min', 'distance_km', 'avg_heart_rate_bpm', 'max_heart_rate_bpm',
+                  'hr_zone_z1_min', 'hr_zone_z2_min', 'hr_zone_z3_min', 'hr_zone_z4_min',
+                  'hr_zone_z5_min', 'cycling_power_avg_w', 'cycling_power_max_w',
+                  'cycling_cadence_avg_rpm', 'source_name', 'hr_source', 'power_source',
+                  'quality_flag']
+
+
+class TestMcpWorkoutAnswers(unittest.TestCase):
+    """Wherever a workout appears it has the same columns, so an answer never
+    has to go back for the start time, the power or which device it came from."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        rides = [
+            {'workout_id': 'a', 'activity_type': 'Cycling', 'date': '2026-05-01',
+             'start_datetime': '2026-05-01 07:00:00 +0300', 'end_datetime': '2026-05-01 07:45:00 +0300',
+             'duration_min': '45', 'avg_heart_rate_bpm': '138', 'max_heart_rate_bpm': '171',
+             'hr_zone_z1_min': '5', 'hr_zone_z2_min': '20', 'hr_zone_z3_min': '15',
+             'hr_zone_z4_min': '5', 'hr_zone_z5_min': '', 'cycling_power_avg_w': '152',
+             'cycling_power_max_w': '410', 'cycling_cadence_avg_rpm': '84',
+             'source_name': 'Wariden', 'hr_source': 'Apple Watch', 'power_source': 'Domyos Bridge',
+             'quality_flag': ''},
+            {'workout_id': 'b', 'activity_type': 'Cycling', 'date': '2026-05-01',
+             'start_datetime': '2026-05-01 18:00:00 +0300', 'end_datetime': '2026-05-02 05:00:00 +0300',
+             'duration_min': '660', 'source_name': 'Strava', 'quality_flag': '11.0 h with no heart rate'},
+        ]
+        with open(os.path.join(self.dir, 'workout_summary.csv'), 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=WORKOUT_FIELDS)
+            w.writeheader()
+            w.writerows(rides)
+        with open(os.path.join(self.dir, 'workout_series.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['workout_id', 'start_datetime', 'minute', 'hr_avg_bpm', 'hr_max_bpm',
+                        'power_avg_w', 'power_max_w', 'cadence_avg_rpm'])
+            for minute in range(45):
+                w.writerow(['a', rides[0]['start_datetime'], minute, 130 + minute // 23 * 10,
+                            150, 150, 200, 85])
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            csv.writer(f).writerows([['date', 'steps'], ['2026-05-01', '5000']])
+        self.data = HealthData(self.dir)
+
+    def _call(self, name, args):
+        return health_mcp.HANDLERS[name](self.data, args)
+
+    def test_workout_list_and_day_detail_share_one_layout(self):
+        header = '| ' + ' | '.join(health_mcp.WORKOUT_HEADERS) + ' |'
+        listed = self._call('health_workouts', {})
+        day = self._call('health_day_detail', {'date': '2026-05-01'})
+        self.assertIn(header, listed)
+        self.assertIn(header, day)
+        for text in (listed, day):
+            self.assertIn('07:00–07:45', text)
+            self.assertIn('5/20/15/5/0', text)
+            self.assertIn('Apple Watch / Domyos Bridge', text)
+
+    def test_the_list_counts_the_flagged_ones(self):
+        listed = self._call('health_workouts', {})
+        self.assertIn('1 look mis-recorded', listed)
+        self.assertIn('suspicious: 11.0 h with no heart rate', listed)
+
+    def test_detail_asks_which_when_a_day_had_several(self):
+        text = self._call('health_workout_detail', {'date': '2026-05-01'})
+        self.assertIn('2 workouts on 2026-05-01; say which', text)
+
+    def test_detail_by_start_time(self):
+        text = self._call('health_workout_detail', {'date': '2026-05-01', 'start': '07:00'})
+        self.assertIn('aerobic decoupling', text)
+        self.assertIn('| minute |', text)
+        self.assertIn('| 44 |', text)
+
+    def test_detail_of_a_flagged_workout_says_so(self):
+        text = self._call('health_workout_detail', {'date': '2026-05-01', 'start': '18:00'})
+        self.assertIn('looks mis-recorded', text)
+        self.assertIn('No heart-rate or power samples', text)
+
+    def test_no_workout_that_day(self):
+        self.assertIn('No workouts', self._call('health_workout_detail', {'date': '2026-05-03'}))
+
+
+class TestMcpFreshness(unittest.TestCase):
+    """Every answer says how fresh the data is: a ride that has not synced yet
+    and a ride that never happened must not look the same."""
+
+    NOW = datetime(2026, 10, 19, 9, 30, tzinfo=timezone.utc)  # 12:30 in Vilnius
+
+    def _data(self, status, days=('2026-10-18', '2026-10-19')):
+        folder = tempfile.mkdtemp()
+        with open(os.path.join(folder, 'daily_metrics.csv'), 'w', newline='') as f:
+            csv.writer(f).writerows([['date', 'steps']] + [[d, '100'] for d in days])
+        if status is not None:
+            with open(os.path.join(folder, 'data_status.json'), 'w') as f:
+                json.dump(status, f)
+        return HealthData(folder)
+
+    BRIDGE = {'source': 'health_bridge', 'timezone': 'Europe/Vilnius',
+              'latest_received': '2026-10-19T09:05:00+00:00',
+              'latest_record': '2026-10-19T08:58:00+00:00',
+              'built_at': '2026-10-18T19:10:00+00:00', 'check_interval_s': 900}
+
+    @unittest.skipUnless(_zone_available('Europe/Vilnius'), 'no tz database')
+    def test_a_synced_pack_says_when_in_local_time(self):
+        line = health_mcp.status_line(self._data(self.BRIDGE), self.NOW)
+        self.assertIn('phone last synced 12:05', line)
+        self.assertIn('newest record 11:58', line)
+        self.assertIn('rebuilt 2026-10-18 22:10', line)
+        self.assertIn('every 15 min', line)
+
+    @unittest.skipUnless(_zone_available('Europe/Vilnius'), 'no tz database')
+    def test_today_is_marked_in_progress(self):
+        line = health_mcp.status_line(self._data(self.BRIDGE), self.NOW)
+        self.assertIn('Today (Mon 19 Oct) is still in progress', line)
+        line = health_mcp.status_line(self._data(self.BRIDGE, days=('2026-10-18',)), self.NOW)
+        self.assertNotIn('in progress', line)
+
+    def test_an_export_says_it_is_not_live(self):
+        line = health_mcp.status_line(self._data({'source': 'apple_export',
+                                                  'latest_record': '2026-03-01T10:00:00+00:00'}),
+                                      self.NOW)
+        self.assertIn('not live', line)
+
+    def test_no_status_file_means_no_line(self):
+        self.assertEqual(health_mcp.status_line(self._data(None), self.NOW), '')
+
+    def test_every_tool_answer_starts_with_it(self):
+        reply = handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                        'params': {'name': 'health_list_metrics', 'arguments': {}}},
+                       self._data(self.BRIDGE))
+        self.assertTrue(reply['result']['content'][0]['text'].startswith('_Data: phone last synced'))
+
+
 class TestExportIngest(unittest.TestCase):
     """Whatever the user points at should work: the zip from their phone, the
     unzipped folder, or the folder they dropped it in."""
@@ -2096,15 +2353,6 @@ class TestReadmeMatchesTheServer(unittest.TestCase):
             int(stated.group(1)), len(self._server_tools()),
             'the README\'s tool count and the server disagree',
         )
-
-
-def _zone_available(name: str) -> bool:
-    try:
-        from zoneinfo import ZoneInfo
-        ZoneInfo(name)
-        return True
-    except Exception:  # noqa: BLE001 -- any failure means "no tz database here"
-        return False
 
 
 @unittest.skipUnless(_zone_available('Europe/Vilnius'),
@@ -2405,6 +2653,17 @@ class TestHealthSync(unittest.TestCase):
         # Nothing in progress is left where a reader could find it.
         self.assertEqual(os.listdir(os.path.join(self.out, 'snapshots')), [name])
         self.assertFalse(os.path.exists(os.path.join(self.out, '.work')))
+
+    def test_the_snapshot_says_how_fresh_it_is(self):
+        import health_sync
+        name = health_sync.rebuild(self._args(interval=600))
+        with open(os.path.join(self.out, 'snapshots', name, 'data_status.json')) as handle:
+            status = json.load(handle)
+        self.assertEqual(status['source'], 'health_bridge')
+        self.assertEqual(status['check_interval_s'], 600)
+        self.assertTrue(status['latest_received'])
+        self.assertTrue(status['latest_record'])
+        self.assertTrue(status['built_at'])
 
     def test_a_failed_rebuild_keeps_serving_the_last_good_one(self):
         import health_sync

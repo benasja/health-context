@@ -315,6 +315,16 @@ def data_status(data: HealthData) -> dict[str, Any]:
         return {}
 
 
+def sync_status(data: HealthData) -> dict[str, Any]:
+    """How health_sync.py's last rebuild went; {} when not run by it."""
+    path = os.path.join(os.path.dirname(data.root), 'sync_status.json')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
 def _local_now(status: dict[str, Any], now: datetime | None = None) -> datetime:
     zone = None
     if status.get('timezone'):
@@ -343,9 +353,18 @@ def status_line(data: HealthData, now: datetime | None = None) -> str:
     and so do a finished day and one still under way.
     """
     status = data_status(data)
-    if not status:
-        return ''
+    sync = sync_status(data)
     now = _local_now(status, now)
+    warning = ''
+    if sync and not sync.get('ok'):
+        warning = (f"**Warning: the server's last rebuild ({_when(sync.get('at', ''), now)}) failed: "
+                   f"{sync.get('error', 'no reason given')}. These answers come from an older build, "
+                   'so anything synced since is missing. Tell the user; the fix is on the server.**\n\n')
+    if not status:
+        if not data.table('daily'):
+            return warning.strip()
+        return warning + ('_Data: when this was built is not recorded (it predates freshness '
+                          'tracking), so recent days may be missing._')
     parts = []
     if status.get('source') == 'health_bridge':
         if status.get('latest_received'):
@@ -365,7 +384,7 @@ def status_line(data: HealthData, now: datetime | None = None) -> str:
     if any(r.get('date') == today for r in data.table('daily')):
         line += (f" Today ({now:%a %d %b}) is still in progress: its totals are "
                  'partial, not final.')
-    return f'_{line}_'
+    return f'{warning}_{line}_'
 
 
 def is_today(data: HealthData, day: date, now: datetime | None = None) -> bool:
@@ -816,7 +835,11 @@ def _workout_detail(data: HealthData, args: dict[str, Any]) -> str:
     lines = [workout_table([w])]
     if w.get('quality_flag'):
         lines += ['', f"This workout looks mis-recorded ({w['quality_flag']}); its numbers may not be real."]
-    rows = [r for r in data.table('series') if r.get('workout_id') == w.get('workout_id')]
+    series = data.table('series')
+    if not series:
+        return '\n'.join(lines + ['', 'This build has no minute-by-minute data at all: it was made '
+                                   'by a version from before it existed, or a rebuild since has failed.'])
+    rows = [r for r in series if r.get('workout_id') == w.get('workout_id')]
     if not rows:
         return '\n'.join(lines + ['', 'No heart-rate or power samples were recorded inside this workout.'])
 

@@ -213,11 +213,19 @@ def build_day(day: date, rng: random.Random, fitness: float) -> Day:
     )
 
 
-def quantity(kind: str, unit: str, value: str, source: str, start: str, end: str | None = None) -> str:
+def quantity(kind: str, unit: str, value: str, source: str, start: str, end: str | None = None,
+             device: str = '') -> str:
+    device_attr = f' device="{esc(device)}"' if device else ''
     return (
         f'  <Record type="HKQuantityTypeIdentifier{kind}" unit="{unit}" value="{value}" '
-        f'sourceName="{esc(source)}" startDate="{start}" endDate="{end or start}"/>'
+        f'sourceName="{esc(source)}"{device_attr} startDate="{start}" endDate="{end or start}"/>'
     )
+
+
+# Power from a trainer paired with the Watch: Health lists the Watch as the
+# source and the trainer only as the device, the way a real export has it.
+TRAINER = '<<HKDevice: 0x600002d1c0a0>, name:KICKR, manufacturer:Wahoo Fitness, model:KICKR>'
+
 
 
 def emit_sleep(out: list[str], d: Day, rng: random.Random) -> None:
@@ -311,7 +319,7 @@ def emit_workout(out: list[str], d: Day, rng: random.Random, max_hr: int) -> Non
                             f'{moment:{fmt}}'))
         if d.workout == 'Cycling':
             out.append(quantity('CyclingPower', 'W', str(int(196 + 38 * training_load(d.day) + rng.gauss(0, 22))),
-                                'Wahoo KICKR', f'{moment:{fmt}}'))
+                                WATCH, f'{moment:{fmt}}', device=TRAINER))
 
     out.append(
         f'  <Workout workoutActivityType="HKWorkoutActivityType{d.workout}" '

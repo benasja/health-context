@@ -129,6 +129,9 @@ class HealthRecord:
     creation: str
     start_raw: str
     end_raw: str
+    # The hardware that measured it, when known (e.g. a power meter paired with
+    # the Watch); source_name is the app or device that wrote it to Health.
+    device: str = ''
 
 
 @dataclass
@@ -679,6 +682,7 @@ def add_parsed_record(
     creation: str,
     start_dt: datetime | None,
     end_dt: datetime | None,
+    device: str = '',
 ) -> bool:
     """Fold one record into `data`, the same way whatever it was read from.
 
@@ -712,9 +716,19 @@ def add_parsed_record(
                 creation=creation,
                 start_raw=start_raw,
                 end_raw=end_raw,
+                device=device,
             )
         )
     return True
+
+
+_DEVICE_NAME = re.compile(r'\bname:([^,>]+)')
+
+
+def device_name(raw: str) -> str:
+    """'<<HKDevice: 0x..>, name:KICKR, manufacturer:Wahoo, ...>' -> 'KICKR'."""
+    match = _DEVICE_NAME.search(raw or '')
+    return match.group(1).strip() if match else ''
 
 
 def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True) -> int:
@@ -753,6 +767,7 @@ def iter_export_xml(filepath: str, data: ExportData, show_progress: bool = True)
                         creation=elem.get('creationDate', '') or '',
                         start_dt=parse_health_datetime(start_raw),
                         end_dt=parse_health_datetime(end_raw),
+                        device=device_name(elem.get('device', '')),
                     ):
                         added += 1
                 elem.clear()
@@ -1331,9 +1346,13 @@ class SampleIndex:
 
 
 def main_source(samples: list[HealthRecord]) -> str:
-    """The source most of a workout's samples came from, e.g. the Watch or a
-    power meter, so figures from different rides can be judged comparable."""
-    counts = Counter(s.source_name for s in samples if s.source_name)
+    """The device most of a workout's samples came from, e.g. the Watch or a
+    power meter, so figures from different rides can be judged comparable.
+
+    The measuring device when Health knows it: power the Watch recorded from a
+    paired trainer has the Watch as its source and the trainer as its device.
+    """
+    counts = Counter(s.device or s.source_name for s in samples if s.device or s.source_name)
     return counts.most_common(1)[0][0] if counts else ''
 
 

@@ -5,11 +5,13 @@
 import argparse
 import csv
 import glob
+import json
 import os
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
+from datetime import timezone as tz
 
 from health_coaching import (
     COACHING_RECORD_TYPES,
@@ -227,8 +229,10 @@ def main() -> None:
 
     data = ExportData()
     if args.bridge_db:
-        _load_bridge(args, data)
+        summary = _load_bridge(args, data)
         _write_outputs(args, out_dir, data)
+        write_data_status(out_dir, data, 'health_bridge',
+                          timezone=summary.timezone_name, latest_received=summary.latest_received)
         return
 
     try:
@@ -274,9 +278,29 @@ def main() -> None:
         print(f"Note: {export_cda_xml} not found (optional)")
 
     _write_outputs(args, out_dir, data, ecg_dir)
+    write_data_status(out_dir, data, 'apple_export')
 
 
-def _load_bridge(args: argparse.Namespace, data: ExportData) -> None:
+def write_data_status(out_dir: str, data: ExportData, source: str,
+                      timezone: str = '', latest_received: str = '') -> None:
+    """How fresh this build is, for every answer built on it.
+
+    Without it a reader can't tell a ride that is missing from one that hasn't
+    synced yet, or a day's 4,900 steps from a day that isn't over.
+    """
+    ends = [r.end for r in data.records] + [w.end for w in data.workouts]
+    status = {
+        'source': source,
+        'built_at': datetime.now(tz.utc).isoformat(timespec='seconds'),
+        'latest_record': max(ends).isoformat(timespec='seconds') if ends else '',
+        'latest_received': latest_received,
+        'timezone': timezone,
+    }
+    with open(os.path.join(out_dir, 'data_status.json'), 'w', encoding='utf-8') as handle:
+        json.dump(status, handle, indent=1)
+
+
+def _load_bridge(args: argparse.Namespace, data: ExportData):
     """Fill `data` from a Health Bridge receiver, and say plainly what was read."""
     import health_bridge_import as bridge
 
@@ -295,6 +319,7 @@ def _load_bridge(args: argparse.Namespace, data: ExportData) -> None:
     if summary.unmapped_types:
         print('  Not recognised, left out: ' + ', '.join(
             f'{name} ({count})' for name, count in summary.unmapped_types.most_common()))
+    return summary
 
 
 def _write_outputs(args: argparse.Namespace, out_dir: str, data: ExportData,

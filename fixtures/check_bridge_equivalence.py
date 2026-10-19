@@ -4,8 +4,8 @@
 Takes a demo folder that has already been converted from export.xml, turns
 that same export into a Health Bridge receiver database (fixtures/
 make_bridge_db.py), converts the database, and compares the two sets of
-outputs: every daily metric, every daily insight, every week, every workout,
-and both reports.
+outputs: every daily metric, every daily insight, every week, every workout
+and its minute-by-minute series, and both reports.
 
 The point is not that the two inputs look alike -- they do not: one is local
 time with offsets, fractions and per-sample steps, the other UTC, 0-100
@@ -83,6 +83,15 @@ def compare_table(name: str, export_rows, bridge_rows, key: str, allowed: set[st
     return problems
 
 
+def series_rows(path: str) -> list[dict[str, str]]:
+    """Minute rows keyed by workout start and minute: the workout id itself
+    differs between the two paths (see ALLOWED_WORKOUT)."""
+    out = rows(path)
+    for row in out:
+        row['key'] = f"{row['start_datetime']} +{row['minute']}"
+    return out
+
+
 def compare_report(name: str, export_text: str, bridge_text: str) -> list[str]:
     problems: list[str] = []
     export_lines, bridge_lines = export_text.splitlines(), bridge_text.splitlines()
@@ -123,6 +132,8 @@ def main() -> None:
                                   rows(f'{out}/weekly_summary.csv'), 'iso_week', set())
         problems += compare_table('workout_summary', rows(f'{demo}/workout_summary.csv'),
                                   rows(f'{out}/workout_summary.csv'), 'start_datetime', ALLOWED_WORKOUT)
+        problems += compare_table('workout_series', series_rows(f'{demo}/workout_series.csv'),
+                                  series_rows(f'{out}/workout_series.csv'), 'key', {'workout_id'})
         for report in ('insights_report.md', 'llm_context.md'):
             with open(f'{demo}/{report}', encoding='utf-8') as a, open(f'{out}/{report}', encoding='utf-8') as b:
                 problems += compare_report(report, a.read(), b.read())

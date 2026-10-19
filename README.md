@@ -124,7 +124,9 @@ packaging only adds the entry points.
 | `daily_metrics.csv` | One row per day, 60+ columns of raw daily aggregates |
 | `daily_insights.csv` | Per-day baselines, deviations, z-scores, scores and flags |
 | `weekly_summary.csv` | One row per ISO week |
-| `workout_summary.csv` | One row per workout, with HR zones and cycling power |
+| `workout_summary.csv` | One row per workout: HR and minutes in each zone, cycling power and cadence, which device recorded them, and a flag on records that look wrong |
+| `workout_series.csv` | Minute by minute HR, power and cadence for each workout |
+| `data_status.json` | When the data was built, its newest record and, from a receiver, when the phone last synced |
 | `metric_coverage.csv` | Per metric: first date, **reliable start**, coverage % |
 | `data_quality_report.txt` | Wear stats, coverage, multi-device warnings, duplicate bursts |
 | `available_types.csv` | Every Health type in the export with counts |
@@ -291,7 +293,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 
 Rather than pasting `llm_context.md` into a chat, let the assistant query your
 data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
-server exposing 13 tools over stdio — still zero dependencies, still entirely
+server exposing 14 tools over stdio — still zero dependencies, still entirely
 local, nothing uploaded anywhere.
 
 ```
@@ -344,11 +346,19 @@ Restart the client afterwards.
 | `health_day_detail` | Everything about one specific day |
 | `health_sleep` | Duration, stages, efficiency, timing |
 | `health_workouts` | Sessions, or totals by activity type |
+| `health_workout_detail` | One workout minute by minute: HR drift at steady power, recovery after the hardest minute |
 | `health_strain_episodes` | Multi-signal physiological flags, grouped |
 | `health_weekly` | Week-by-week rollup |
 | `health_context_pack` | The whole briefing |
 | `health_profile` | Your goals and constraints, if you wrote any down |
 | `health_data_quality` | Wear rates, coverage, excluded artifacts |
+
+Every answer starts with one line saying how fresh the data is (when the phone
+last synced, the newest record, when it was rebuilt) and, if today is
+involved, that today's totals are still partial. Workouts are shown with the
+same columns wherever they appear: start and end, HR, minutes in each zone,
+power, cadence, the device that recorded them, and a flag on records that look
+wrong (hours long with no heart rate, a speed no one rides at).
 
 ### What one of them actually returns
 
@@ -497,7 +507,7 @@ answering from old numbers.
 ## Development
 
 ```bash
-python3 test_health.py                  # 268 tests, stdlib only
+python3 test_health.py                  # 295 tests, stdlib only
 pip install ruff && ruff check .
 ```
 

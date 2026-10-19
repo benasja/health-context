@@ -37,6 +37,7 @@ Layout of --out-root:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -226,6 +227,7 @@ def rebuild(args: argparse.Namespace) -> str | None:
             shutil.rmtree(partial, ignore_errors=True)
             return None
 
+        _note_check_interval(partial, args.interval)
         os.rename(partial, os.path.join(snapshot_dir, name))
         switch_current(out_root, name)
     finally:
@@ -237,6 +239,20 @@ def rebuild(args: argparse.Namespace) -> str | None:
     log(f'now serving {name} ({time.monotonic() - started:.1f}s). {summary}'
         + (f' Removed {len(removed)} old snapshot(s).' if removed else ''))
     return name
+
+
+def _note_check_interval(snapshot: str, interval_s: float) -> None:
+    """Add how often this loop looks for new data to the build's status file,
+    so an answer can say when newer data could next appear."""
+    path = os.path.join(snapshot, 'data_status.json')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            status = json.load(handle)
+    except (OSError, ValueError):
+        return
+    status['check_interval_s'] = int(interval_s)
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump(status, handle, indent=1)
 
 
 def lock(out_root: str):

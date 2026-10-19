@@ -15,6 +15,7 @@ import re
 import statistics
 import sys
 import time
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -1314,10 +1315,68 @@ def metrics_in_workout_window(workout: Workout, samples: list[HealthRecord]) -> 
     ]
 
 
+class SampleIndex:
+    """Samples of one type sorted by start, for picking out a workout's window.
+
+    A linear scan per workout is fine for a few hundred power samples; a few
+    years of heart rate is half a million, times every workout.
+    """
+
+    def __init__(self, samples: list[HealthRecord]):
+        self.samples = sorted(samples, key=lambda s: s.start)
+        self.starts = [s.start for s in self.samples]
+
+    def within(self, start: datetime, end: datetime) -> list[HealthRecord]:
+        return self.samples[bisect_left(self.starts, start):bisect_left(self.starts, end)]
+
+
+def main_source(samples: list[HealthRecord]) -> str:
+    """The source most of a workout's samples came from, e.g. the Watch or a
+    power meter, so figures from different rides can be judged comparable."""
+    counts = Counter(s.source_name for s in samples if s.source_name)
+    return counts.most_common(1)[0][0] if counts else ''
+
+
+# Average speeds nobody holds for a whole session: above them the distance or
+# the duration was recorded wrong, and the workout's numbers are not a result.
+MAX_PLAUSIBLE_AVG_KMH = {'Cycling': 60.0, 'Running': 25.0, 'Walking': 10.0, 'Hiking': 10.0}
+LONG_WITHOUT_HR_MIN = 240
+IMPLAUSIBLY_LONG_MIN = 16 * 60
+
+
+def workout_quality_flag(row: dict[str, Any]) -> str:
+    """Why a workout looks mis-recorded, or '' if nothing does.
+
+    Hours-long sessions with no heart rate at all are the typical bad import
+    (an app that left a workout running, or a merged duplicate). Flagged, not
+    dropped: whether to trust it stays a decision for whoever reads it.
+    """
+    def number(key):
+        value = row.get(key)
+        return value if isinstance(value, (int, float)) else None
+
+    reasons = []
+    minutes = number('duration_min')
+    if minutes is not None and minutes >= LONG_WITHOUT_HR_MIN and number('avg_heart_rate_bpm') is None:
+        reasons.append(f'{minutes / 60:.1f} h with no heart rate')
+    if minutes is not None and minutes > IMPLAUSIBLY_LONG_MIN:
+        reasons.append('longer than 16 h')
+    km = number('distance_km')
+    activity = row.get('activity_type', '')
+    limit = next((v for k, v in MAX_PLAUSIBLE_AVG_KMH.items() if k in activity), None)
+    if limit and km and minutes:
+        kmh = km / (minutes / 60.0)
+        if kmh > limit:
+            reasons.append(f'average {kmh:.0f} km/h')
+    return '; '.join(reasons)
+
+
 def build_workout_summary(data: ExportData, max_hr: float = DEFAULT_MAX_HR) -> list[dict[str, Any]]:
     hr_samples = heart_rate_samples(data)
     power_samples = cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingPower')
     cadence_samples = cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingCadence')
+    hr_index = SampleIndex(hr_samples)
+    power_index = SampleIndex(power_samples)
 
     rows: list[dict[str, Any]] = []
     for workout in sorted(data.workouts, key=lambda w: w.start):
@@ -1387,8 +1446,47 @@ def build_workout_summary(data: ExportData, max_hr: float = DEFAULT_MAX_HR) -> l
             'cycling_cadence_avg_rpm': round(statistics.mean(cadence_vals), 1)
             if cadence_vals else (round(cadence_avg, 1) if cadence_avg is not None else ''),
             'source_name': workout.source_name,
+            'hr_source': main_source(hr_index.within(workout.start, workout.end)),
+            'power_source': main_source(power_index.within(workout.start, workout.end)),
         })
+        rows[-1]['quality_flag'] = workout_quality_flag(rows[-1])
 
+    return rows
+
+
+def build_workout_series(data: ExportData) -> list[dict[str, Any]]:
+    """Heart rate, power and cadence per minute of every workout that has them.
+
+    Enough to see what an average hides: heart rate drifting up at steady
+    power, or how fast it came down after a sprint.
+    """
+    indexes = {
+        'hr': SampleIndex(heart_rate_samples(data)),
+        'power': SampleIndex(cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingPower')),
+        'cadence': SampleIndex(cycling_metric_samples(data, 'HKQuantityTypeIdentifierCyclingCadence')),
+    }
+    rows: list[dict[str, Any]] = []
+    for workout in sorted(data.workouts, key=lambda w: w.start):
+        minutes: dict[int, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+        for key, index in indexes.items():
+            for sample in index.within(workout.start, workout.end):
+                minute = int((sample.start - workout.start).total_seconds() // 60)
+                minutes[minute][key].append(sample.value)
+        if not minutes:
+            continue
+        workout_id = workout_id_for(workout)
+        for minute in sorted(minutes):
+            vals = minutes[minute]
+            rows.append({
+                'workout_id': workout_id,
+                'start_datetime': workout.start_raw,
+                'minute': minute,
+                'hr_avg_bpm': round(statistics.mean(vals['hr']), 1) if vals['hr'] else '',
+                'hr_max_bpm': round(max(vals['hr']), 1) if vals['hr'] else '',
+                'power_avg_w': round(statistics.mean(vals['power']), 1) if vals['power'] else '',
+                'power_max_w': round(max(vals['power']), 1) if vals['power'] else '',
+                'cadence_avg_rpm': round(statistics.mean(vals['cadence']), 1) if vals['cadence'] else '',
+            })
     return rows
 
 
@@ -1718,6 +1816,7 @@ def write_coaching_outputs(
     paths = {
         'daily_metrics': os.path.join(base_dir, 'daily_metrics.csv'),
         'workout_summary': os.path.join(base_dir, 'workout_summary.csv'),
+        'workout_series': os.path.join(base_dir, 'workout_series.csv'),
         'weekly_summary': os.path.join(base_dir, 'weekly_summary.csv'),
         'metric_coverage': os.path.join(base_dir, 'metric_coverage.csv'),
         'available_types': os.path.join(base_dir, 'available_types.csv'),
@@ -1731,8 +1830,14 @@ def write_coaching_outputs(
          'total_energy_kcal', 'active_energy_kcal', 'distance_km', 'avg_heart_rate_bpm',
          'max_heart_rate_bpm', 'hr_zone_z1_min', 'hr_zone_z2_min', 'hr_zone_z3_min',
          'hr_zone_z4_min', 'hr_zone_z5_min', 'cycling_power_avg_w', 'cycling_power_max_w',
-         'cycling_cadence_avg_rpm', 'source_name'],
+         'cycling_cadence_avg_rpm', 'source_name', 'hr_source', 'power_source', 'quality_flag'],
         workout_rows,
+    )
+    write_csv(
+        paths['workout_series'],
+        ['workout_id', 'start_datetime', 'minute', 'hr_avg_bpm', 'hr_max_bpm',
+         'power_avg_w', 'power_max_w', 'cadence_avg_rpm'],
+        build_workout_series(data),
     )
     write_csv(paths['weekly_summary'], weekly_column_order(), weekly_rows)
     write_csv(

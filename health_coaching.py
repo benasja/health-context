@@ -92,7 +92,7 @@ STRENGTH_WORKOUT_TYPES = {
     'HKWorkoutActivityTypeCoreTraining',
 }
 
-CYCLING_WORKOUT_TYPES = {'HKWorkoutActivityTypeCycling'}
+CYCLING_WORKOUT_TYPES = {'HKWorkoutActivityTypeCycling', 'HKWorkoutActivityTypeIndoorCycling'}
 
 WALKING_WORKOUT_TYPES = {
     'HKWorkoutActivityTypeWalking',

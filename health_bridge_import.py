@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -79,7 +80,8 @@ STAGE_TO_EXPORT = {
 }
 
 # The companion app's names for workout types, mapped back to HealthKit's.
-# Anything else arrives as "other", which is what HealthKit calls it too.
+# Names not listed here are HealthKit's own in snake_case ("cooldown",
+# "mixed_cardio") and are turned back by workout_activity_type.
 WORKOUT_TO_EXPORT = {
     'running': 'HKWorkoutActivityTypeRunning',
     'walking': 'HKWorkoutActivityTypeWalking',
@@ -97,7 +99,21 @@ WORKOUT_TO_EXPORT = {
     'dance': 'HKWorkoutActivityTypeDance',
     'mind_and_body': 'HKWorkoutActivityTypeMindAndBody',
     'other': 'HKWorkoutActivityTypeOther',
+    # HealthKit marks an indoor ride with metadata, not a type; the app sends it
+    # as its own name so the trainer and the road stay apart.
+    'indoor_cycling': 'HKWorkoutActivityTypeIndoorCycling',
 }
+
+WORKOUT_NAME = re.compile(r'[a-z][a-z0-9]*(?:_[a-z0-9]+)*')
+
+
+def workout_activity_type(kind: str | None) -> str:
+    """HealthKit's name for a workout type the companion app sent."""
+    if kind in WORKOUT_TO_EXPORT:
+        return WORKOUT_TO_EXPORT[kind]
+    if kind and WORKOUT_NAME.fullmatch(kind):
+        return 'HKWorkoutActivityType' + ''.join(part.capitalize() for part in kind.split('_'))
+    return 'HKWorkoutActivityTypeOther'
 
 # Which distance statistic a workout's total distance belongs to, so the
 # per-activity distance logic downstream finds it where an export puts it.
@@ -106,6 +122,7 @@ WORKOUT_DISTANCE_STAT = {
     'walking': 'HKQuantityTypeIdentifierDistanceWalkingRunning',
     'hiking': 'HKQuantityTypeIdentifierDistanceWalkingRunning',
     'cycling': 'HKQuantityTypeIdentifierDistanceCycling',
+    'indoor_cycling': 'HKQuantityTypeIdentifierDistanceCycling',
     'swimming': 'HKQuantityTypeIdentifierDistanceSwimming',
 }
 
@@ -447,7 +464,7 @@ def _load_workouts(conn, data: ExportData, tz: tzinfo, summary: BridgeSummary) -
             'w.distance_meters, src.name, w.created_at '
             'from workouts w join sources src on src.source_id = w.source_id order by w.start_time'):
         start, end = parse_utc(start_raw).astimezone(tz), parse_utc(end_raw).astimezone(tz)
-        activity = WORKOUT_TO_EXPORT.get(kind, 'HKWorkoutActivityTypeOther')
+        activity = workout_activity_type(kind)
         statistics: dict[str, dict] = {}
         if kcal is not None:
             statistics['HKQuantityTypeIdentifierActiveEnergyBurned'] = {

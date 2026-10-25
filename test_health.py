@@ -21,6 +21,7 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
 from health_coaching import (
+    CYCLING_WORKOUT_TYPES,
     DEDUP_INTERVAL_TYPES,
     DEDUP_PRIMARY_TYPES,
     SLEEP_TYPE,
@@ -2623,7 +2624,7 @@ class TestHealthBridgeImport(unittest.TestCase):
         conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
                      "duration_seconds, energy_kcal, distance_meters) values "
                      "(1, 'w1', 'running', '2026-06-01T15:00:00Z', '2026-06-01T15:40:00Z', 2400, 380.0, 7500.0), "
-                     "(1, 'w2', 'kickboxing_maybe', '2026-06-02T15:00:00Z', '2026-06-02T15:30:00Z', 1800, 200.0, NULL)")
+                     "(1, 'w2', 'Not A Type!', '2026-06-02T15:00:00Z', '2026-06-02T15:30:00Z', 1800, 200.0, NULL)")
         conn.commit()
         conn.close()
         data, summary, _days = self._load()
@@ -2635,6 +2636,24 @@ class TestHealthBridgeImport(unittest.TestCase):
         self.assertEqual(run['date'], '2026-06-01')
         self.assertTrue(any('Other' in r['activity_type'] for r in rows))
         self.assertEqual(summary.workouts, 2)
+
+    def test_cooldowns_and_indoor_rides_keep_their_own_names(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
+                     "duration_seconds, energy_kcal, distance_meters) values "
+                     "(1, 'w1', 'cooldown', '2026-06-01T05:00:00Z', '2026-06-01T05:15:00Z', 900, 40.0, NULL), "
+                     "(1, 'w2', 'indoor_cycling', '2026-06-01T15:00:00Z', '2026-06-01T16:00:00Z', 3600, 500.0, 30000.0), "
+                     "(1, 'w3', 'cycling', '2026-06-02T15:00:00Z', '2026-06-02T16:00:00Z', 3600, 600.0, 25000.0), "
+                     "(1, 'w4', 'mixed_cardio', '2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 1800, 200.0, NULL)")
+        conn.commit()
+        conn.close()
+        data, _summary, _days = self._load()
+        rows = {r['activity_type']: r for r in build_workout_summary(data)}
+        self.assertEqual(set(rows), {'Cooldown', 'Indoor Cycling', 'Cycling', 'Mixed Cardio'})
+        self.assertEqual(rows['Indoor Cycling']['distance_km'], 30.0)
+        self.assertEqual(rows['Cycling']['distance_km'], 25.0)
+        self.assertEqual(sum(w.workout_activity_type in CYCLING_WORKOUT_TYPES for w in data.workouts), 2)
 
     def test_the_receivers_database_is_never_written(self):
         import hashlib

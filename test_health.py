@@ -2655,6 +2655,55 @@ class TestHealthBridgeImport(unittest.TestCase):
         self.assertEqual(rows['Cycling']['distance_km'], 25.0)
         self.assertEqual(sum(w.workout_activity_type in CYCLING_WORKOUT_TYPES for w in data.workouts), 2)
 
+    def test_a_ride_saved_by_two_apps_counts_once_keeping_the_one_with_distance(self):
+        import sqlite3
+
+        from health_coaching import merge_duplicate_workouts
+        conn = sqlite3.connect(self.db)
+        conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
+                     "duration_seconds, energy_kcal, distance_meters) values "
+                     "(1, 'w1', 'indoor_cycling', '2026-05-05T15:43:54Z', '2026-05-05T16:02:56Z', 1142, 118.0, NULL), "
+                     "(1, 'w2', 'indoor_cycling', '2026-05-05T15:43:51Z', '2026-05-05T15:59:08Z', 917, 108.0, 5184.0), "
+                     "(1, 'w3', 'traditional_strength_training', '2026-05-05T15:50:00Z', '2026-05-05T16:00:00Z', 600, 50.0, NULL), "
+                     "(1, 'w4', 'indoor_cycling', '2026-05-06T15:43:54Z', '2026-05-06T16:02:56Z', 1142, 118.0, NULL)")
+        conn.commit()
+        conn.close()
+        data, _summary, _days = self._load()
+        kept, notes = merge_duplicate_workouts(data.workouts)
+        self.assertEqual(len(kept), 3)
+        rides = [w for w in kept if w.start.date().isoformat() == '2026-05-05' and 'Cycling' in w.workout_activity_type]
+        self.assertEqual(len(rides), 1)
+        self.assertEqual(rides[0].statistics['HKQuantityTypeIdentifierDistanceCycling']['sum'], 5.184)
+        self.assertEqual(len(notes), 1)
+
+    def test_a_reading_written_twice_is_one_reading(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        meta = json.dumps({'healthkit_identifier': 'HKQuantityTypeIdentifierHeartRate',
+                           'healthkit_source_name': 'Bluetooth Device', 'sample_kind': 'raw_quantity'})
+        for record_id, created in (('h1', '2026-05-10T13:00:05Z'), ('h2', '2026-05-10T13:04:00Z')):
+            conn.execute('insert into samples (source_id, type_code, client_record_id, start_time, end_time, '
+                         'value, unit, metadata_json, created_at) values (1, ?, ?, ?, ?, ?, ?, ?, ?)',
+                         ('heart_rate', record_id, '2026-05-10T13:00:00Z', '2026-05-10T13:00:00Z',
+                          140.0, 'bpm', meta, created))
+        conn.commit()
+        conn.close()
+        data, _summary, _days = self._load()
+        hr = [r for r in data.records if r.type == 'HKQuantityTypeIdentifierHeartRate']
+        self.assertEqual(len(hr), 1)
+        self.assertEqual(data.repeated_readings['HKQuantityTypeIdentifierHeartRate'], 1)
+
+    def test_an_hour_stood_logged_by_phone_and_watch_is_one_hour(self):
+        for source in ('Benas iPhone', 'Apple Watch', 'Apple Watch'):
+            self._sample('HKCategoryTypeIdentifierAppleStandHour', 'stand_hour',
+                         '2026-06-01T08:00:00Z', '2026-06-01T09:00:00Z', 0.0, 'count',
+                         healthkit_source_name=source, sample_kind='category')
+        self._sample('HKCategoryTypeIdentifierAppleStandHour', 'stand_hour',
+                     '2026-06-01T09:00:00Z', '2026-06-01T10:00:00Z', 0.0, 'count',
+                     healthkit_source_name='Apple Watch', sample_kind='category')
+        _data, _summary, days = self._load()
+        self.assertEqual(int(float(days['2026-06-01']['stand_hours_met'])), 2)
+
     def test_the_receivers_database_is_never_written(self):
         import hashlib
         import sqlite3

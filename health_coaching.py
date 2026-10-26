@@ -288,6 +288,12 @@ class ExportData:
     wear: WearTracker = field(default_factory=WearTracker)
     effort: EffortTracker = field(default_factory=EffortTracker)
     stand_hours: dict[date, int] = field(default_factory=lambda: defaultdict(int))
+    # Hours already counted, so the phone and the watch both logging one is one hour.
+    stand_hour_slots: set[datetime] = field(default_factory=set)
+    # Copies of a reading an app wrote twice, left out (by HealthKit type).
+    repeated_readings: Counter = field(default_factory=Counter)
+    # One line per workout dropped as a second recording of another.
+    merged_workouts: list[str] = field(default_factory=list)
     mindful_minutes: dict[date, float] = field(default_factory=lambda: defaultdict(float))
     first_seen: dict[str, date] = field(default_factory=dict)
     sources: Counter = field(default_factory=Counter)
@@ -573,7 +579,8 @@ def ingest_record(
         return
 
     if record_type == STAND_HOUR_TYPE:
-        if is_stand_hour_met(value_raw):
+        if is_stand_hour_met(value_raw) and start_dt not in data.stand_hour_slots:
+            data.stand_hour_slots.add(start_dt)
             data.stand_hours[day] += 1
         return
 
@@ -697,6 +704,12 @@ def add_parsed_record(
     because the XML loop counts every record it sees, parsed or not.
     """
     if data.mark_seen(creation, start_raw, end_raw, record_type, value_raw, source_name):
+        return False
+    # A sensor relayed by two apps can land the same reading twice, minutes apart:
+    # identical but for its creation time. A reading of one moment is one reading.
+    if record_type in REPEATABLE_READING_TYPES and data.mark_seen(
+            'reading', start_raw, end_raw, record_type, value_raw, normalize_source(source_name)):
+        data.repeated_readings[record_type] += 1
         return False
     if not (start_dt and end_dt):
         return False
@@ -1641,6 +1654,64 @@ def empty_ratio(rows: list[dict[str, Any]], column: str) -> float:
     return empty / len(rows)
 
 
+REPEATABLE_READING_TYPES = {
+    'HKQuantityTypeIdentifierHeartRate',
+    'HKQuantityTypeIdentifierCyclingPower',
+    'HKQuantityTypeIdentifierCyclingCadence',
+    'HKQuantityTypeIdentifierCyclingSpeed',
+}
+
+# Two apps recording one session (a bike app and the watch) each save a workout.
+# Same activity, overlapping for most of the shorter one: one session, counted once.
+DUPLICATE_WORKOUT_OVERLAP = 0.8
+
+
+def _workout_family(activity: str) -> str:
+    return 'cycling' if activity in CYCLING_WORKOUT_TYPES else activity
+
+
+def _workout_richness(workout: Workout) -> tuple:
+    has_distance = workout.total_distance is not None or any(
+        'Distance' in key for key in workout.statistics)
+    has_energy = workout.total_energy is not None or bool(workout.statistics)
+    seconds = (workout.end - workout.start).total_seconds()
+    return has_distance, has_energy, len(workout.statistics), seconds
+
+
+def merge_duplicate_workouts(workouts: list[Workout]) -> tuple[list[Workout], list[str]]:
+    """Keeps one workout per session recorded twice, and says which were dropped.
+
+    The one kept is the one with a distance, then energy, then the longest.
+    """
+    kept: list[Workout] = []
+    notes: list[str] = []
+    for workout in sorted(workouts, key=lambda w: w.start):
+        twin = None
+        for index in range(len(kept) - 1, -1, -1):
+            other = kept[index]
+            if other.start < workout.start - timedelta(hours=24):
+                break
+            if _workout_family(other.workout_activity_type) != _workout_family(workout.workout_activity_type):
+                continue
+            shorter = min((other.end - other.start).total_seconds(),
+                          (workout.end - workout.start).total_seconds())
+            overlap = (min(other.end, workout.end) - max(other.start, workout.start)).total_seconds()
+            if shorter > 0 and overlap / shorter >= DUPLICATE_WORKOUT_OVERLAP:
+                twin = index
+                break
+        if twin is None:
+            kept.append(workout)
+            continue
+        other = kept[twin]
+        keep, drop = ((workout, other) if _workout_richness(workout) > _workout_richness(other)
+                      else (other, workout))
+        kept[twin] = keep
+        minutes = (drop.end - drop.start).total_seconds() / 60.0
+        notes.append(f'  {drop.start_raw[:16]} {friendly_workout_type(drop.workout_activity_type)} '
+                     f'({minutes:.0f} min) — a second recording of the one at {keep.start_raw[11:16]}')
+    return kept, notes
+
+
 def detect_duplicate_bursts(records: list[HealthRecord], threshold: int = 50) -> list[str]:
     by_minute: Counter = Counter()
     for rec in records:
@@ -1749,6 +1820,13 @@ def write_data_quality_report(
 
     lines.extend(['', f'Outputs: {len(daily_rows)} daily rows, {len(workout_rows)} workouts, {len(weekly_rows)} weeks'])
 
+    lines.append('')
+    lines.append('Workouts recorded twice (two apps, one session), counted once:')
+    lines.extend(data.merged_workouts or ['  none'])
+    lines.append('Readings an app wrote twice, left out:')
+    lines.extend([f'  {t.replace("HKQuantityTypeIdentifier", "")}: {n:,}'
+                  for t, n in data.repeated_readings.most_common()] or ['  none'])
+
     burst_lines = detect_duplicate_bursts(data.records)
     lines.append('')
     lines.append('Duplicate bursts (>=50 records of one type in a single minute):')
@@ -1814,6 +1892,8 @@ def write_coaching_outputs(
     max_hr_override: float | None = None,
     age: int | None = None,
 ) -> CoachingResult:
+    data.workouts, merged = merge_duplicate_workouts(data.workouts)
+    data.merged_workouts.extend(merged)
     data.timezone_label = infer_timezone_label(data.records, data.workouts)
 
     hr_samples = heart_rate_samples(data)

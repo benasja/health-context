@@ -2643,7 +2643,8 @@ class TestHealthBridgeImport(unittest.TestCase):
         conn.execute("insert into workouts (source_id, client_record_id, workout_type, start_time, end_time, "
                      "duration_seconds, energy_kcal, distance_meters) values "
                      "(1, 'w1', 'cooldown', '2026-06-01T05:00:00Z', '2026-06-01T05:15:00Z', 900, 40.0, NULL), "
-                     "(1, 'w2', 'indoor_cycling', '2026-06-01T15:00:00Z', '2026-06-01T16:00:00Z', 3600, 500.0, 30000.0), "
+                     "(1, 'w2', 'indoor_cycling', '2026-06-01T15:00:00Z', '2026-06-01T16:00:00Z', "
+                     "3600, 500.0, 30000.0), "
                      "(1, 'w3', 'cycling', '2026-06-02T15:00:00Z', '2026-06-02T16:00:00Z', 3600, 600.0, 25000.0), "
                      "(1, 'w4', 'mixed_cardio', '2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 1800, 200.0, NULL)")
         conn.commit()
@@ -2664,7 +2665,8 @@ class TestHealthBridgeImport(unittest.TestCase):
                      "duration_seconds, energy_kcal, distance_meters) values "
                      "(1, 'w1', 'indoor_cycling', '2026-05-05T15:43:54Z', '2026-05-05T16:02:56Z', 1142, 118.0, NULL), "
                      "(1, 'w2', 'indoor_cycling', '2026-05-05T15:43:51Z', '2026-05-05T15:59:08Z', 917, 108.0, 5184.0), "
-                     "(1, 'w3', 'traditional_strength_training', '2026-05-05T15:50:00Z', '2026-05-05T16:00:00Z', 600, 50.0, NULL), "
+                     "(1, 'w3', 'traditional_strength_training', '2026-05-05T15:50:00Z', "
+                     "'2026-05-05T16:00:00Z', 600, 50.0, NULL), "
                      "(1, 'w4', 'indoor_cycling', '2026-05-06T15:43:54Z', '2026-05-06T16:02:56Z', 1142, 118.0, NULL)")
         conn.commit()
         conn.close()

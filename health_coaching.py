@@ -295,6 +295,8 @@ class ExportData:
     # One line per workout dropped as a second recording of another.
     merged_workouts: list[str] = field(default_factory=list)
     mindful_minutes: dict[date, float] = field(default_factory=lambda: defaultdict(float))
+    # Sets logged in Wariden (health_strength.StrengthSet), from a receiver only.
+    strength_sets: list[Any] = field(default_factory=list)
     first_seen: dict[str, date] = field(default_factory=dict)
     sources: Counter = field(default_factory=Counter)
     metric_sources: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))

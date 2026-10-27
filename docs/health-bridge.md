@@ -204,6 +204,29 @@ succeeds.
 Sleep and workouts are labelled with the companion app as their source rather
 than the Watch. Only the label changes.
 
+### Strength sets from Wariden
+
+Apple Health holds a strength workout only as time, energy and heart rate.
+Wariden, when paired with the receiver, also sends every ticked set of every
+finished workout as a `strength_set` sample. The weight in kg is the value
+(0 for bodyweight), and the rest is in the metadata as strings:
+
+| key | |
+|---|---|
+| `workout_id`, `workout_start`, `workout_end`, `program`, `workout_notes` | the workout |
+| `exercise`, `equipment`, `muscle_group`, `exercise_number` | the exercise, numbered in the order done |
+| `set_number`, `set_type`, `warmup`, `weight_kg`, `reps`, `rpe`, `notes` | the set |
+
+The importer turns them into `strength_sets.csv` (one row per set) and
+`strength_sessions.csv` (one row per workout, with the overlapping Apple Health
+workout's energy and heart rate). Both are plain CSV, so they are the export:
+copy them out of `current/`. The MCP tools `health_strength_sessions`,
+`health_strength_session` and `health_strength_progress` read them.
+
+A workout edited in Wariden is sent again under new record IDs, and the old
+ones are deleted. A workout deleted in Wariden is deleted on the receiver too,
+so the files always match the app.
+
 ## Which receiver versions work
 
 Tested against receiver **v1.1.2**, whose storage schema is unchanged on its

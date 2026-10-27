@@ -56,6 +56,7 @@ from health_coaching import (
     Workout,
     add_parsed_record,
 )
+from health_strength import STRENGTH_SET_TYPE, strength_set
 
 # The tables and columns read here. Anything missing means the receiver's
 # schema changed in a way this code was not written for, and the right answer
@@ -155,6 +156,7 @@ class BridgeSummary:
     raw_replaced_by_daily_total: int = 0
     sleep_stages: int = 0
     workouts: int = 0
+    strength_sets: int = 0
     unmapped_types: Counter = field(default_factory=Counter)
     not_parsed_types: Counter = field(default_factory=Counter)
     # When the receiver last stored something from the phone (UTC, ISO), so a
@@ -385,6 +387,15 @@ def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],
     for type_code, start_raw, end_raw, value, unit, meta_raw, source, created in conn.execute(
             query + 'order by s.start_time'):
         meta = _metadata(meta_raw)
+        if type_code == STRENGTH_SET_TYPE:
+            # Not Apple Health at all: a set logged in Wariden.
+            logged = strength_set(meta, float(value), parse_utc(start_raw), tz)
+            if logged:
+                data.strength_sets.append(logged)
+                summary.strength_sets += 1
+            else:
+                summary.unmapped_types[f'{type_code} without its details'] += 1
+            continue
         hk = meta.get('healthkit_identifier') or aliases.get(type_code)
         if not hk:
             summary.unmapped_types[type_code] += 1

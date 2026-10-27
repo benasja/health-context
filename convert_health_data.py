@@ -26,6 +26,7 @@ from health_coaching import (
 )
 import health_ingest
 from health_insights import write_insight_outputs
+from health_strength import write_strength_outputs
 
 
 def format_cda_date(date_str: str) -> str:
@@ -317,6 +318,8 @@ def _load_bridge(args: argparse.Namespace, data: ExportData):
     print(f'  Timezone: {summary.timezone_name} ({summary.timezone_reason})')
     print(f'  Read {summary.samples:,} samples ({summary.daily_totals:,} of them daily totals '
           f'from the phone), {summary.sleep_stages:,} sleep stages, {summary.workouts:,} workouts')
+    if summary.strength_sets:
+        print(f'  Read {summary.strength_sets:,} strength sets logged in Wariden')
     if summary.raw_replaced_by_daily_total:
         print(f'  Left out {summary.raw_replaced_by_daily_total:,} raw samples on days the phone '
               'already sent its own de-duplicated total for')
@@ -358,6 +361,8 @@ def _write_outputs(args: argparse.Namespace, out_dir: str, data: ExportData,
     else:
         print('Profile: none — add profile.md so an analysis knows your goals '
               '(see profile.example.md)')
+
+    result.paths.update(write_strength_outputs(out_dir, data.strength_sets, result.workout_rows))
 
     print('Building insights...')
     insight_paths = write_insight_outputs(

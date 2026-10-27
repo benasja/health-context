@@ -2755,6 +2755,27 @@ class TestHealthBridgeImport(unittest.TestCase):
             conn.close()
 
 
+    def test_a_set_logged_in_wariden_is_read_as_a_set_on_the_local_clock(self):
+        # Not an Apple Health type: without its own path it was counted as an
+        # unknown type and the whole strength log was dropped.
+        self._sample(None, 'strength_set', '2026-06-01T21:10:00Z', '2026-06-01T21:10:00Z', 22.5, 'kg',
+                     wariden_record='strength_set', workout_id='w1', workout_start='2026-06-01T21:00:00Z',
+                     workout_end='2026-06-01T21:50:00Z', program='Upper A', exercise='Flat Dumbbell Bench Press',
+                     exercise_number='1', set_number='2', reps='8', weight_kg='22.5', rpe='8',
+                     set_type='Working', warmup='false')
+        self._sample(None, 'strength_set', '2026-06-01T21:11:00Z', '2026-06-01T21:11:00Z', 0.0, 'kg',
+                     wariden_record='strength_set')
+        data, summary, _days = self._load()
+        self.assertEqual(summary.strength_sets, 1)
+        self.assertNotIn('strength_set', summary.unmapped_types)
+        self.assertEqual(summary.unmapped_types['strength_set without its details'], 1)
+        logged = data.strength_sets[0]
+        self.assertEqual((logged.exercise, logged.weight_kg, logged.reps, logged.rpe),
+                         ('Flat Dumbbell Bench Press', 22.5, 8, 8))
+        # 21:00 UTC is midnight in Vilnius: the session is on 2 June there.
+        self.assertEqual(logged.workout_start.date().isoformat(), '2026-06-02')
+        self.assertEqual(logged.time.strftime('%H:%M'), '00:10')
+
 @unittest.skipUnless(os.name == 'posix' and _zone_available('Etc/GMT-3'),
                      'needs symlinks and a timezone database; the receiver runs on macOS/Linux')
 class TestHealthSync(unittest.TestCase):
@@ -2976,6 +2997,114 @@ class TestHealthSync(unittest.TestCase):
         data.follow()
         self.assertTrue(data.dir.endswith(second))
         self.assertIsNot(data.table('daily'), rows_before)
+
+
+def _strength_set(exercise, number, set_number, weight, reps, minute, warmup=False, rpe=None,
+                  workout_id='w1', program='Upper A', day=1):
+    from health_strength import StrengthSet
+    zone = timezone(timedelta(hours=3))
+    start = datetime(2026, 6, day, 7, 0, tzinfo=zone)
+    return StrengthSet(
+        workout_id=workout_id, workout_start=start, workout_end=start + timedelta(minutes=50),
+        program=program, exercise=exercise, equipment='Dumbbell', muscle_group='Chest',
+        exercise_number=number, set_number=set_number, set_type='Warmup' if warmup else 'Working',
+        warmup=warmup, weight_kg=weight, reps=reps, rpe=rpe, time=start + timedelta(minutes=minute),
+        notes='', workout_notes='')
+
+
+class TestStrengthLog(unittest.TestCase):
+    """Sets logged in Wariden, from the receiver to the CSVs and the MCP answers."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.sets = [
+            _strength_set('Pull-Ups', 2, 1, 0.0, 6, 20),
+            _strength_set('Flat Dumbbell Bench Press', 1, 1, 10.0, 10, 3, warmup=True),
+            _strength_set('Flat Dumbbell Bench Press', 1, 2, 22.5, 10, 5, rpe=7),
+            _strength_set('Flat Dumbbell Bench Press', 1, 3, 22.5, 8, 8, rpe=9),
+            _strength_set('Flat Dumbbell Bench Press', 1, 1, 25.0, 8, 5, workout_id='w2', day=4),
+            _strength_set('Flat Dumbbell Bench Press', 1, 2, 25.0, 15, 8, workout_id='w2', day=4),
+        ]
+        self.health = [{'workout_id': 'hw', 'activity_type': 'Traditional Strength Training',
+                        'start_datetime': '2026-06-01 06:58:00 +0300', 'end_datetime': '2026-06-01 07:52:00 +0300',
+                        'active_energy_kcal': 210.4, 'avg_heart_rate_bpm': 118, 'max_heart_rate_bpm': 151},
+                       {'workout_id': 'walk', 'activity_type': 'Walking',
+                        'start_datetime': '2026-06-01 07:45:00 +0300', 'end_datetime': '2026-06-01 08:30:00 +0300'}]
+        import health_strength
+        health_strength.write_strength_outputs(self.dir, self.sets, self.health)
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            csv.writer(f).writerows([['date', 'steps'], ['2026-06-01', '5000'], ['2026-06-04', '6000']])
+        self.data = HealthData(self.dir)
+
+    def _call(self, name, args):
+        return health_mcp.HANDLERS[name](self.data, args)
+
+    def test_sets_are_in_workout_then_exercise_then_set_order(self):
+        import health_strength
+        rows = health_strength.build_set_rows(self.sets)
+        self.assertEqual([(r['workout_id'], r['exercise_number'], r['set_number']) for r in rows],
+                         [('w1', 1, 1), ('w1', 1, 2), ('w1', 1, 3), ('w1', 2, 1), ('w2', 1, 1), ('w2', 1, 2)])
+
+    def test_e1rm_only_where_the_formula_fits(self):
+        import health_strength
+        rows = {(r['workout_id'], r['exercise_number'], r['set_number']): r
+                for r in health_strength.build_set_rows(self.sets)}
+        self.assertEqual(rows[('w1', 1, 2)]['e1rm_kg'], 30.0)        # 22.5 x (1 + 10/30)
+        self.assertEqual(rows[('w1', 1, 1)]['e1rm_kg'], '')          # warm-up
+        self.assertEqual(rows[('w1', 1, 1)]['volume_kg'], '')
+        self.assertEqual(rows[('w1', 2, 1)]['e1rm_kg'], '')          # bodyweight
+        self.assertEqual(rows[('w2', 1, 2)]['e1rm_kg'], '')          # 15 reps is past the formula
+
+    def test_a_session_carries_the_apple_health_workout_it_overlaps_most(self):
+        import health_strength
+        sessions = health_strength.build_session_rows(self.sets, self.health)
+        first = sessions[0]
+        self.assertEqual(first['health_workout_id'], 'hw')
+        self.assertEqual(first['active_energy_kcal'], 210.4)
+        self.assertEqual((first['working_sets'], first['warmup_sets'], first['total_reps']), (3, 1, 24))
+        self.assertEqual(first['volume_kg'], '405')
+        self.assertEqual(first['exercise_summary'], 'Flat Dumbbell Bench Press 22.5x10, 22.5x8; Pull-Ups BWx6')
+        self.assertEqual(sessions[1]['health_workout_id'], '')
+
+    def test_the_session_list_reads_like_a_log(self):
+        text = self._call('health_strength_sessions', {})
+        self.assertIn('**2 strength sessions**', text)
+        self.assertIn('Flat Dumbbell Bench Press 22.5x10, 22.5x8; Pull-Ups BWx6', text)
+        self.assertIn('07:00–07:50', text)
+        only = self._call('health_strength_sessions', {'exercise': 'pull'})
+        self.assertIn('**1 strength sessions**', only)
+
+    def test_one_session_set_by_set(self):
+        text = self._call('health_strength_session', {'date': '2026-06-01'})
+        self.assertIn('# Upper A, 2026-06-01 07:00–07:50', text)
+        self.assertIn('3 working sets, 24 reps, 405 kg volume, 1 warm-up sets, 210 kcal active', text)
+        self.assertIn('| 1 | Flat Dumbbell Bench Press | 3 | Working | 22.5 | 8 | 9 | 28.5 | 07:08 |  |', text)
+        latest = self._call('health_strength_session', {})
+        self.assertIn('2026-06-04', latest)
+        self.assertIn('No strength session', self._call('health_strength_session', {'date': '2026-06-02'}))
+
+    def test_progress_of_one_exercise_and_the_list_of_all(self):
+        text = self._call('health_strength_progress', {'exercise': 'bench'})
+        self.assertIn('# Flat Dumbbell Bench Press: 2 sessions', text)
+        self.assertIn('30 kg on 2026-06-01, 31.7 kg on 2026-06-04 (+1.7 kg)', text)
+        self.assertIn('| 2026-06-04 | Upper A | 2 | 8/15 | 25x15 |', text)
+        listed = self._call('health_strength_progress', {})
+        self.assertIn('**2 exercises logged**', listed)
+        self.assertIn('| Pull-Ups | 1 | 1 | 2026-06-01 | BWx6 |  |', listed)
+        self.assertIn('No exercise matching', self._call('health_strength_progress', {'exercise': 'squat'}))
+
+    def test_the_day_and_the_overview_point_at_the_log(self):
+        self.assertIn('## Strength logged in Wariden', self._call('health_day_detail', {'date': '2026-06-01'}))
+        self.assertIn('Strength log from Wariden: 2 sessions, latest 2026-06-04 (Upper A)',
+                      self._call('health_overview', {}))
+
+    def test_a_build_without_any_says_where_they_come_from(self):
+        empty = tempfile.mkdtemp()
+        import health_strength
+        health_strength.write_strength_outputs(empty, [], [])
+        data = HealthData(empty)
+        for name in ('health_strength_sessions', 'health_strength_session', 'health_strength_progress'):
+            self.assertIn('Apple Health itself never holds', health_mcp.HANDLERS[name](data, {}))
 
 
 if __name__ == '__main__':

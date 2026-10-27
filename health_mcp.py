@@ -29,7 +29,7 @@ from typing import Any
 from collections.abc import Callable
 
 SERVER_NAME = 'apple-health'
-SERVER_VERSION = '2.1.0'
+SERVER_VERSION = '2.2.0'
 
 # Protocol revisions this server is known to work against. If a client asks for
 # something else it still gets a usable session — the tool surface has not
@@ -97,6 +97,8 @@ class HealthData:
         'workouts': 'workout_summary.csv',
         'series': 'workout_series.csv',
         'coverage': 'metric_coverage.csv',
+        'strength_sets': 'strength_sets.csv',
+        'strength_sessions': 'strength_sessions.csv',
     }
     DOCS = {
         'context': 'llm_context.md',
@@ -545,9 +547,20 @@ def _overview(data: HealthData, _args: dict[str, Any]) -> str:
         # the two disagreeing.
         cut = context.find('## Distribution')
         head = context[:cut] if cut > 0 else context
-        return truncate(head.strip() + '\n\n' + _freshness_note(data),
+        return truncate(head.strip() + '\n\n' + _strength_note(data) + _freshness_note(data),
                         'Use health_context_pack for specific sections.')
     return _fallback_overview(data)
+
+
+def _strength_note(data: HealthData) -> str:
+    sessions = data.table('strength_sessions')
+    if not sessions:
+        return ''
+    last = sessions[-1]
+    program = f" ({last['program']})" if last.get('program') else ''
+    return (f'_Strength log from Wariden: {len(sessions)} sessions, latest {last.get("date", "")}'
+            f'{program}. Exercises, sets, reps and weights: health_strength_sessions, '
+            'health_strength_session, health_strength_progress._\n\n')
 
 
 def _freshness_note(data: HealthData) -> str:
@@ -569,7 +582,7 @@ def _fallback_overview(data: HealthData) -> str:
         wear[row.get('wear_class', 'none')] = wear.get(row.get('wear_class', 'none'), 0) + 1
     return (f'{len(dates)} days, {min(dates).isoformat()} to {max(dates).isoformat()}.\n'
             + 'Wear: ' + ', '.join(f'{v} {k}' for k, v in wear.items())
-            + '\n\n' + _freshness_note(data))
+            + '\n\n' + _strength_note(data) + _freshness_note(data))
 
 
 @tool(
@@ -733,6 +746,10 @@ def _day_detail(data: HealthData, args: dict[str, Any]) -> str:
     if workouts:
         lines += ['', '## Workouts', '', workout_table(workouts),
                   '', 'Minute by minute: health_workout_detail with this date.']
+    lifted = [s for s in data.table('strength_sessions') if s.get('date') == target.isoformat()]
+    if lifted:
+        lines += ['', '## Strength logged in Wariden', '', strength_session_table(lifted),
+                  '', 'Set by set: health_strength_session with this date.']
     return '\n'.join(lines)
 
 
@@ -889,6 +906,190 @@ def _workout_detail(data: HealthData, args: dict[str, Any]) -> str:
     label = 'minute' if step == 1 else 'from minute (5-min blocks)'
     lines += ['', table([label, 'avg HR', 'max HR', 'avg W', 'max W', 'rpm'], table_rows)]
     return '\n'.join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Strength log (Wariden)
+# ---------------------------------------------------------------------------
+
+STRENGTH_SESSION_HEADERS = ['date', 'time', 'program', 'exercises', 'working sets', 'reps',
+                            'volume kg', 'kcal', 'avg HR', 'what was done (kg x reps)']
+NO_STRENGTH = ('No strength sets from Wariden in this build. They arrive once Wariden is paired '
+               'with the home server and a workout with logged sets has synced; Apple Health '
+               'itself never holds exercises, sets or weights.')
+
+
+def strength_session_row(s: dict[str, str]) -> list[str]:
+    return [s.get('date', ''),
+            f"{_clock(s.get('start_datetime', ''))}–{_clock(s.get('end_datetime', ''))}",
+            s.get('program', ''), s.get('exercises', ''), s.get('working_sets', ''),
+            s.get('total_reps', ''), s.get('volume_kg', ''),
+            fmt(to_float(s.get('active_energy_kcal')), 0) if s.get('active_energy_kcal') else '',
+            s.get('avg_heart_rate_bpm', ''), s.get('exercise_summary', '')]
+
+
+def strength_session_table(sessions: list[dict[str, str]]) -> str:
+    return table(STRENGTH_SESSION_HEADERS, [strength_session_row(s) for s in sessions])
+
+
+def _in_range(raw: str, start: date | None, end: date | None) -> bool:
+    if not raw:
+        return False
+    d = date.fromisoformat(raw)
+    return not ((start and d < start) or (end and d > end))
+
+
+def _set_load(s: dict[str, str]) -> str:
+    weight = to_float(s.get('weight_kg')) or 0.0
+    return f"{fmt(weight) if weight > 0 else 'BW'}x{s.get('reps', '')}"
+
+
+@tool(
+    'health_strength_sessions',
+    'Strength workouts logged in Wariden: program, exercises, working sets, reps, volume and '
+    'each exercise\'s sets as weight x reps, with energy and heart rate from the Apple Health '
+    'workout recorded at the same time. Apple Health alone has no sets or weights; this does.',
+    obj({'start': DATE_PROP, 'end': DATE_PROP,
+         'program': {'type': 'string', 'description': 'Substring, e.g. "Upper A"'},
+         'exercise': {'type': 'string', 'description': 'Only sessions that include this exercise (substring)'}}),
+)
+def _strength_sessions(data: HealthData, args: dict[str, Any]) -> str:
+    sessions = data.table('strength_sessions')
+    if not sessions:
+        return NO_STRENGTH
+    start, end = parse_date(args.get('start')), parse_date(args.get('end'))
+    program = (args.get('program') or '').lower()
+    exercise = (args.get('exercise') or '').lower()
+    picked = [s for s in sessions
+              if _in_range(s.get('date', ''), start, end)
+              and program in s.get('program', '').lower()
+              and exercise in s.get('exercise_summary', '').lower()]
+    if not picked:
+        return 'No strength sessions match.'
+    shown = picked[-MAX_ROWS:]
+    return truncate(f'**{len(picked)} strength sessions**, showing last {len(shown)}. Warm-ups are left '
+                    'out of sets, reps and volume.\n\n' + strength_session_table(shown),
+                    'Narrow the dates.')
+
+
+@tool(
+    'health_strength_session',
+    'One Wariden strength workout set by set: exercise, set type, weight, reps, RPE, estimated '
+    'one-rep max and notes. Give the date (and the start time if that day had several); with '
+    'neither, the latest session.',
+    obj({'date': DATE_PROP,
+         'start': {'type': 'string', 'description': 'Start time HH:MM, when the day had several sessions'}}),
+)
+def _strength_session(data: HealthData, args: dict[str, Any]) -> str:
+    sessions = data.table('strength_sessions')
+    if not sessions:
+        return NO_STRENGTH
+    target = parse_date(args.get('date'))
+    if target is None:
+        day = sessions[-1:]
+    else:
+        day = [s for s in sessions if s.get('date') == target.isoformat()]
+        if not day:
+            return f'No strength session logged on {target.isoformat()}.'
+    start = (args.get('start') or '').strip()
+    picked = [s for s in day if start and _clock(s.get('start_datetime', '')) == start]
+    if not picked and len(day) == 1 and not start:
+        picked = day
+    if not picked:
+        return (f'{len(day)} strength sessions on {day[0].get("date")}; say which by its start time.\n\n'
+                + strength_session_table(day))
+    session = picked[0]
+    sets = [s for s in data.table('strength_sets') if s.get('workout_id') == session.get('workout_id')]
+
+    lines = [f"# {session.get('program') or 'Strength session'}, {session.get('date')} "
+             f"{_clock(session.get('start_datetime', ''))}–{_clock(session.get('end_datetime', ''))}", '']
+    facts = [f"{session.get('working_sets')} working sets", f"{session.get('total_reps')} reps",
+             f"{session.get('volume_kg')} kg volume"]
+    if session.get('warmup_sets') not in ('', '0'):
+        facts.append(f"{session['warmup_sets']} warm-up sets")
+    if session.get('active_energy_kcal'):
+        facts.append(f"{fmt(to_float(session['active_energy_kcal']), 0)} kcal active")
+    if session.get('avg_heart_rate_bpm'):
+        facts.append(f"HR avg {session['avg_heart_rate_bpm']}, max {session.get('max_heart_rate_bpm') or 'n/a'}")
+    lines.append(', '.join(facts) + '.')
+    if session.get('notes'):
+        lines += ['', f"Notes: {session['notes']}"]
+    rows = [[s.get('exercise_number', ''), s.get('exercise', ''), s.get('set_number', ''),
+             s.get('set_type', ''), s.get('weight_kg', ''), s.get('reps', ''), s.get('rpe', ''),
+             s.get('e1rm_kg', ''), _clock(s.get('time', '')), s.get('notes', '')] for s in sets]
+    lines += ['', table(['#', 'exercise', 'set', 'type', 'kg', 'reps', 'RPE', 'e1RM kg', 'at', 'notes'], rows),
+              '', 'Weight 0 is bodyweight. e1RM is Epley\'s estimate, given only for working sets of '
+              '1-12 reps with weight.']
+    return truncate('\n'.join(lines))
+
+
+@tool(
+    'health_strength_progress',
+    'How one exercise has moved across Wariden sessions: per session the working sets, reps, top '
+    'set and best estimated one-rep max. Without an exercise, every exercise logged with its '
+    'session count, last date and best numbers -- use that to find the exact name.',
+    obj({'exercise': {'type': 'string', 'description': 'Exercise name or a unique part of it'},
+         'start': DATE_PROP, 'end': DATE_PROP}),
+)
+def _strength_progress(data: HealthData, args: dict[str, Any]) -> str:
+    start, end = parse_date(args.get('start')), parse_date(args.get('end'))
+    sets = [s for s in data.table('strength_sets')
+            if _in_range(s.get('date', ''), start, end) and s.get('warmup') != 'yes']
+    if not data.table('strength_sets'):
+        return NO_STRENGTH
+    if not sets:
+        return 'No working sets logged in that range.'
+
+    by_exercise: dict[str, list[dict[str, str]]] = {}
+    for s in sets:
+        by_exercise.setdefault(s.get('exercise', ''), []).append(s)
+
+    def best(rows: list[dict[str, str]]) -> tuple[str, str]:
+        estimates = [v for v in (to_float(r.get('e1rm_kg')) for r in rows) if v is not None]
+        top = max(rows, key=lambda r: (to_float(r.get('weight_kg')) or 0.0, int(r.get('reps') or 0)))
+        return (fmt(max(estimates), 1) if estimates else ''), _set_load(top)
+
+    wanted = (args.get('exercise') or '').strip().lower()
+    if not wanted:
+        rows = []
+        for name, done in sorted(by_exercise.items(), key=lambda kv: -len({r['workout_id'] for r in kv[1]})):
+            estimate, top = best(done)
+            rows.append([name, str(len({r['workout_id'] for r in done})), str(len(done)),
+                         max(r['date'] for r in done), top, estimate])
+        return truncate(f'**{len(by_exercise)} exercises logged**\n\n'
+                        + table(['exercise', 'sessions', 'working sets', 'last done', 'heaviest set',
+                                 'best e1RM kg'], rows))
+
+    exact = [n for n in by_exercise if n.lower() == wanted]
+    matches = exact or [n for n in by_exercise if wanted in n.lower()]
+    if not matches:
+        return f'No exercise matching "{args["exercise"]}". Call this without an exercise to list them.'
+    if len(matches) > 1:
+        return f'"{args["exercise"]}" matches several exercises; say which: ' + ', '.join(sorted(matches))
+    name = matches[0]
+
+    sessions: dict[str, list[dict[str, str]]] = {}
+    for s in by_exercise[name]:
+        sessions.setdefault(s['workout_id'], []).append(s)
+    rows, estimates = [], []
+    for done in sessions.values():
+        estimate, top = best(done)
+        if estimate:
+            estimates.append((done[0]['date'], float(estimate)))
+        volume = sum((to_float(r.get('weight_kg')) or 0.0) * int(r.get('reps') or 0) for r in done)
+        rows.append([done[0]['date'], done[0].get('program', ''), str(len(done)),
+                     '/'.join(r.get('reps', '') for r in done), top, estimate, fmt(volume, 1),
+                     '/'.join(r['rpe'] for r in done if r.get('rpe'))])
+    lines = [f'# {name}: {len(sessions)} sessions', '']
+    if len(estimates) >= 2:
+        (first_day, first), (last_day, last) = estimates[0], estimates[-1]
+        peak_day, peak = max(estimates, key=lambda e: e[1])
+        lines.append(f'Estimated one-rep max {fmt(first, 1)} kg on {first_day}, {fmt(last, 1)} kg on '
+                     f'{last_day} ({last - first:+.1f} kg); best {fmt(peak, 1)} kg on {peak_day}.')
+        lines.append('')
+    lines.append(table(['date', 'program', 'working sets', 'reps', 'top set', 'best e1RM kg',
+                        'volume kg', 'RPE'], rows[-MAX_ROWS:]))
+    return truncate('\n'.join(lines), 'Narrow the dates.')
 
 
 @tool(

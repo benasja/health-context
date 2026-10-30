@@ -29,7 +29,7 @@ from typing import Any
 from collections.abc import Callable
 
 SERVER_NAME = 'apple-health'
-SERVER_VERSION = '2.2.0'
+SERVER_VERSION = '2.3.0'
 
 # Protocol revisions this server is known to work against. If a client asks for
 # something else it still gets a usable session — the tool surface has not
@@ -1090,6 +1090,127 @@ def _strength_progress(data: HealthData, args: dict[str, Any]) -> str:
     lines.append(table(['date', 'program', 'working sets', 'reps', 'top set', 'best e1RM kg',
                         'volume kg', 'RPE'], rows[-MAX_ROWS:]))
     return truncate('\n'.join(lines), 'Narrow the dates.')
+
+
+# ---------------------------------------------------------------------------
+# Heart rate through the day
+# ---------------------------------------------------------------------------
+
+HR_RESOLUTIONS = [5, 10, 15, 30, 60, 120, 240, 360, 720, 1440]
+
+
+def _moment(raw: str | None, end_of_day: bool = False) -> str | None:
+    """'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' -> a comparable 'YYYY-MM-DD HH:MM'."""
+    if not raw:
+        return None
+    raw = raw.strip().replace('T', ' ')
+    try:
+        if len(raw) == 10:
+            date.fromisoformat(raw)
+            return raw + (' 23:59' if end_of_day else ' 00:00')
+        return datetime.strptime(raw[:16], '%Y-%m-%d %H:%M').strftime('%Y-%m-%d %H:%M')
+    except ValueError as exc:
+        raise ValueError(f'"{raw}" is not a date or time. Use YYYY-MM-DD or YYYY-MM-DD HH:MM.') from exc
+
+
+def _hr_rows(path: str, first: str, last: str) -> list[dict[str, str]]:
+    """The buckets between two local times. Streamed: the file holds years of them."""
+    rows = []
+    with open(path, newline='', encoding='utf-8') as handle:
+        for row in csv.DictReader(handle):
+            local = row['time'][:16]
+            if local > last:
+                break
+            if local >= first:
+                rows.append(row)
+    return rows
+
+
+def _hr_group(start: str, rows: list[dict[str, str]]) -> dict[str, Any]:
+    weights = [int(r['samples'] or 1) for r in rows]
+    contexts: dict[str, int] = {}
+    sources: dict[str, int] = {}
+    for r, w in zip(rows, weights, strict=True):
+        contexts[r.get('context', '')] = contexts.get(r.get('context', ''), 0) + w
+        sources[r.get('source', '')] = sources.get(r.get('source', ''), 0) + w
+    return {
+        'time': start,
+        'avg': sum(float(r['avg_hr']) * w for r, w in zip(rows, weights, strict=True)) / sum(weights),
+        'min': min(float(r['min_hr']) for r in rows),
+        'max': max(float(r['max_hr']) for r in rows),
+        'samples': sum(weights),
+        'context': max(contexts, key=contexts.get),
+        'source': max(sources, key=sources.get),
+    }
+
+
+@tool(
+    'health_hr_timeline',
+    'Heart rate through the day, from every Watch reading: average, lowest and highest per '
+    'bucket, each labelled with the sleep stage or workout it fell in. Use it to graph a day, a '
+    'night or a stretch of days. Times are local. Buckets are 5 minutes unless a coarser '
+    'resolution is asked for, or needed to fit (at most 400 rows).',
+    obj({'start': {'type': 'string', 'description': 'YYYY-MM-DD or YYYY-MM-DD HH:MM; default the latest day'},
+         'end': {'type': 'string', 'description': 'YYYY-MM-DD (whole day) or YYYY-MM-DD HH:MM; default the start day'},
+         'resolution_min': {'type': 'integer', 'description': 'Bucket minutes: 5, 10, 15, 30, 60 ... 1440'},
+         'format': {'type': 'string', 'enum': ['table', 'csv'],
+                    'description': 'csv is more compact for plotting'}}),
+)
+def _hr_timeline(data: HealthData, args: dict[str, Any]) -> str:
+    path = os.path.join(data.dir, 'hr_timeline.csv')
+    if not os.path.exists(path):
+        return ('This build has no heart-rate timeline: it was made by a version from before it existed. '
+                'The next rebuild adds it.')
+    first = _moment(args.get('start'))
+    if first is None:
+        last_day = data.freshness()[0]
+        first = f'{(last_day or date.today()).isoformat()} 00:00'
+    last = _moment(args.get('end'), end_of_day=True) or f'{first[:10]} 23:59'
+    if last < first:
+        return 'The end is before the start.'
+    rows = _hr_rows(path, first, last)
+    if not rows:
+        return f'No heart-rate readings between {first} and {last}.'
+
+    wanted = int(args.get('resolution_min') or 5)
+    choices = [r for r in HR_RESOLUTIONS if r >= wanted] or HR_RESOLUTIONS[-1:]
+    for resolution in choices:
+        groups: dict[tuple[str, int], list[dict[str, str]]] = {}
+        for r in rows:
+            minute = int(r['time'][11:13]) * 60 + int(r['time'][14:16])
+            groups.setdefault((r['time'][:10], minute // resolution), []).append(r)
+        if len(groups) <= MAX_ROWS:
+            break
+    buckets = [_hr_group(f'{day} {minutes * resolution // 60:02d}:{minutes * resolution % 60:02d}', g)
+               for (day, minutes), g in groups.items()]
+
+    total = sum(b['samples'] for b in buckets)
+    lines = [f'**Heart rate {first} to {last}**, {resolution}-minute buckets, {total:,} readings.']
+    if resolution != wanted:
+        lines[0] += f' ({wanted}-minute buckets would be more than {MAX_ROWS} rows.)'
+    # From the five-minute rows, so a coarse bucket spanning a night and a
+    # morning doesn't count the morning as sleep.
+    by_context: dict[str, list[dict[str, str]]] = {}
+    for r in rows:
+        kind = r['context'].split(':')[0] if r.get('context') else 'other'
+        by_context.setdefault(kind, []).append(r)
+    summary = [f"lowest {fmt(min(b['min'] for b in buckets), 0)}, highest {fmt(max(b['max'] for b in buckets), 0)}"]
+    for kind, group in sorted(by_context.items()):
+        summary.append(f"{kind} avg {fmt(_hr_group('', group)['avg'], 0)}")
+    lines.append(', '.join(summary) + ' bpm. "other" is outside sleep and workouts: walking and resting '
+                 'can\'t be told apart, because steps arrive only as daily totals.')
+
+    one_day = first[:10] == last[:10]
+    several_sources = len({b['source'] for b in buckets}) > 1
+    headers = ['time', 'avg', 'min', 'max', 'context'] + (['source'] if several_sources else [])
+    table_rows = [[b['time'][11:] if one_day else b['time'], fmt(b['avg'], 0), fmt(b['min'], 0),
+                   fmt(b['max'], 0), b['context']] + ([b['source']] if several_sources else [])
+                  for b in buckets]
+    if args.get('format') == 'csv':
+        body = '```csv\n' + '\n'.join(','.join(row) for row in [headers] + table_rows) + '\n```'
+    else:
+        body = table(headers, table_rows)
+    return truncate('\n'.join(lines) + '\n\n' + body, 'Ask for a coarser resolution_min or a shorter range.')
 
 
 @tool(

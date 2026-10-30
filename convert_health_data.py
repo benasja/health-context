@@ -26,6 +26,7 @@ from health_coaching import (
 )
 import health_ingest
 from health_insights import write_insight_outputs
+from health_hr_timeline import write_hr_timeline
 from health_strength import write_strength_outputs
 
 
@@ -363,6 +364,7 @@ def _write_outputs(args: argparse.Namespace, out_dir: str, data: ExportData,
               '(see profile.example.md)')
 
     result.paths.update(write_strength_outputs(out_dir, data.strength_sets, result.workout_rows))
+    result.paths.update(write_hr_timeline(out_dir, data))
 
     print('Building insights...')
     insight_paths = write_insight_outputs(

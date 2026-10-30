@@ -227,6 +227,16 @@ A workout edited in Wariden is sent again under new record IDs, and the old
 ones are deleted. A workout deleted in Wariden is deleted on the receiver too,
 so the files always match the app.
 
+### Heart rate through the day
+
+Every `heart_rate` sample the receiver holds, not only those inside workouts,
+goes into `hr_timeline.csv`: one row per local five-minute bucket with the
+average, lowest and highest reading, how many readings there were, and the
+workout or sleep stage the bucket fell in. The MCP tool `health_hr_timeline`
+reads it for any span of days or hours, coarsening the buckets when the span is
+long. A bucket outside a workout or sleep has no label. The phone sends steps
+only as daily totals, so there is nothing to tell walking from sitting.
+
 ## Which receiver versions work
 
 Tested against receiver **v1.1.2**, whose storage schema is unchanged on its

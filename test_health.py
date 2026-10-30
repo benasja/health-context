@@ -3107,5 +3107,75 @@ class TestStrengthLog(unittest.TestCase):
             self.assertIn('Apple Health itself never holds', health_mcp.HANDLERS[name](data, {}))
 
 
+class TestHeartRateTimeline(unittest.TestCase):
+    """Heart rate through a day, labelled with what was going on."""
+
+    def setUp(self):
+        import health_hr_timeline
+        hr = lambda t, bpm, source='Apple Watch': rec(  # noqa: E731
+            'HKQuantityTypeIdentifierHeartRate', bpm, source, t, t, unit='count/min')
+        data = ExportData()
+        data.records = [
+            # Asleep: two readings in the 02:00 bucket, one in deep sleep.
+            sleep_rec('Apple Watch', dt(2026, 6, 1, 1, 0), dt(2026, 6, 1, 2, 0), 'AsleepCore'),
+            sleep_rec('Apple Watch', dt(2026, 6, 1, 2, 0), dt(2026, 6, 1, 3, 0), 'AsleepDeep'),
+            hr(dt(2026, 6, 1, 2, 1), 50.0), hr(dt(2026, 6, 1, 2, 4), 54.0),
+            # Morning, nothing going on.
+            hr(dt(2026, 6, 1, 9, 0), 72.0, 'iPhone'),
+            # A ride.
+            hr(dt(2026, 6, 1, 17, 10), 140.0), hr(dt(2026, 6, 1, 17, 12), 150.0),
+        ]
+        data.workouts = [TestWorkoutHeartRateZones._workout(None, dt(2026, 6, 1, 17, 0), dt(2026, 6, 1, 18, 0))]
+        self.rows = health_hr_timeline.build_hr_timeline(data)
+        self.dir = tempfile.mkdtemp()
+        health_hr_timeline.write_hr_timeline(self.dir, data)
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            csv.writer(f).writerows([['date', 'steps'], ['2026-06-01', '5000']])
+        self.data = HealthData(self.dir)
+
+    def _call(self, args):
+        return health_mcp.HANDLERS['health_hr_timeline'](self.data, args)
+
+    def test_readings_fold_into_five_minute_buckets_with_their_context(self):
+        self.assertEqual(
+            [(r['time'], r['avg_hr'], r['min_hr'], r['max_hr'], r['samples'], r['context']) for r in self.rows],
+            [('2026-06-01 02:00 +0300', 52.0, 50, 54, 2, 'sleep: deep'),
+             ('2026-06-01 09:00 +0300', 72.0, 72, 72, 1, ''),
+             ('2026-06-01 17:10 +0300', 145.0, 140, 150, 2, 'workout: Cycling')])
+
+    def test_a_day_with_its_summary_by_context(self):
+        text = self._call({'start': '2026-06-01'})
+        self.assertIn('5 readings', text)
+        self.assertIn('lowest 50, highest 150, other avg 72, sleep avg 52, workout avg 145 bpm', text)
+        self.assertIn('| 02:00 | 52 | 50 | 54 | sleep: deep | Apple Watch |', text)
+        self.assertIn('| 09:00 | 72 | 72 | 72 |  | iPhone |', text)
+
+    def test_coarser_buckets_weight_by_readings_and_csv_is_compact(self):
+        text = self._call({'start': '2026-06-01', 'resolution_min': 1440, 'format': 'csv'})
+        # (50 + 54 + 72 + 140 + 150) / 5 readings, not the mean of the three buckets,
+        # and labelled with the bucket's start rather than its first reading.
+        self.assertIn('```csv\ntime,avg,min,max,context\n00:00,93,50,150,', text)
+        # The context averages still come from the five-minute rows.
+        self.assertIn('sleep avg 52, workout avg 145', text)
+
+    def test_a_partial_range_by_time(self):
+        text = self._call({'start': '2026-06-01 08:00', 'end': '2026-06-01 18:00'})
+        self.assertNotIn('02:00', text)
+        self.assertIn('17:10', text)
+
+    def test_too_many_rows_are_coarsened_and_said_so(self):
+        old = health_mcp.MAX_ROWS
+        health_mcp.MAX_ROWS = 2
+        try:
+            text = self._call({'start': '2026-06-01'})
+        finally:
+            health_mcp.MAX_ROWS = old
+        self.assertIn('(5-minute buckets would be more than 2 rows.)', text)
+
+    def test_a_build_from_before_it_existed_says_so(self):
+        os.remove(os.path.join(self.dir, 'hr_timeline.csv'))
+        self.assertIn('no heart-rate timeline', self._call({}))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

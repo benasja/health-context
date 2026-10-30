@@ -126,6 +126,7 @@ packaging only adds the entry points.
 | `weekly_summary.csv` | One row per ISO week |
 | `workout_summary.csv` | One row per workout: HR and minutes in each zone, cycling power and cadence, which device recorded them, and a flag on records that look wrong |
 | `workout_series.csv` | Minute by minute HR, power and cadence for each workout |
+| `hr_timeline.csv` | Every heart-rate reading in 5-minute buckets (avg, min, max), labelled with the sleep stage or workout it fell in |
 | `strength_sets.csv` | From a receiver, when Wariden sends its log: one row per set — exercise, set type, weight, reps, RPE, volume, estimated 1RM, notes |
 | `strength_sessions.csv` | One row per Wariden strength workout: program, sets, reps, volume, each exercise as weight x reps, and the matching Apple Health workout's energy and heart rate |
 | `data_status.json` | When the data was built, its newest record and, from a receiver, when the phone last synced |
@@ -288,6 +289,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
 | `health_bridge_import.py` | Reads a Health Bridge receiver's database in place of an export |
+| `health_hr_timeline.py` | Heart rate through the day in 5-minute buckets, with sleep and workout context |
 | `health_strength.py` | Sets logged in Wariden, from the receiver, into the strength CSVs |
 | `health_sync.py` | Unattended rebuild loop for a receiver, with atomic snapshots |
 | `health_mcp.py` | MCP server over the generated files |
@@ -296,7 +298,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 
 Rather than pasting `llm_context.md` into a chat, let the assistant query your
 data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
-server exposing 17 tools over stdio — still zero dependencies, still entirely
+server exposing 18 tools over stdio — still zero dependencies, still entirely
 local, nothing uploaded anywhere.
 
 ```
@@ -350,6 +352,7 @@ Restart the client afterwards.
 | `health_sleep` | Duration, stages, efficiency, timing |
 | `health_workouts` | Sessions, or totals by activity type |
 | `health_workout_detail` | One workout minute by minute: HR drift at steady power, recovery after the hardest minute |
+| `health_hr_timeline` | Heart rate through a day or night in 5-minute buckets, each labelled with its sleep stage or workout — for graphing |
 | `health_strength_sessions` | Strength workouts logged in Wariden: program, sets, reps, volume, weight x reps per exercise |
 | `health_strength_session` | One strength workout set by set: weight, reps, RPE, estimated 1RM, notes |
 | `health_strength_progress` | One exercise across sessions (top set, best estimated 1RM), or every exercise logged |

@@ -897,19 +897,28 @@ def _cluster_sleep_sessions(
 def aggregate_sleep_by_day(records: list[HealthRecord]) -> dict[date, dict[str, Any]]:
     """Per-night sleep totals, stages, timing and efficiency.
 
+    Deep + core + REM will not always equal the reported total: older watch
+    firmware and third-party trackers log AsleepUnspecified, which counts as
+    sleep but carries no stage. That remainder is surfaced separately as
+    sleep_unspecified_hours rather than quietly breaking the arithmetic.
+    """
+    return {day: _summarize_night(session, source)
+            for day, (source, session) in chosen_sleep_sessions(records).items()}
+
+
+def chosen_sleep_sessions(
+    records: list[HealthRecord],
+) -> dict[date, tuple[str, list[tuple[datetime, datetime, str]]]]:
+    """Each night's sleep segments from the one source chosen for it.
+
     Segments are first grouped per source into continuous sessions, then each
     session is attributed to the day it ended on (the wake day). Where several
     sources logged the same night — a sleep tracker, the watch, and the phone's
     in-bed guess — one is chosen rather than summed: staged data (REM/Core/Deep)
     wins, and among equals the one recording the most sleep wins.
 
-    Only the main session of each day is reported, so a daytime nap never
+    Only the main session of each day is kept, so a daytime nap never
     overwrites the night's timing.
-
-    Deep + core + REM will not always equal the reported total: older watch
-    firmware and third-party trackers log AsleepUnspecified, which counts as
-    sleep but carries no stage. That remainder is surfaced separately as
-    sleep_unspecified_hours rather than quietly breaking the arithmetic.
     """
     by_source: dict[str, list[tuple[datetime, datetime, str]]] = defaultdict(list)
     seen: set[tuple] = set()
@@ -937,10 +946,10 @@ def aggregate_sleep_by_day(records: list[HealthRecord]) -> dict[date, dict[str, 
             wake_day = local_calendar_date(max(e for _s, e, _l in session))
             candidates[wake_day].append((staged, asleep, source, session))
 
-    result: dict[date, dict[str, Any]] = {}
+    result: dict[date, tuple[str, list[tuple[datetime, datetime, str]]]] = {}
     for day, options in candidates.items():
-        staged, _asleep, source, session = max(options, key=lambda o: (o[0], o[1]))
-        result[day] = _summarize_night(session, source)
+        _staged, _asleep, source, session = max(options, key=lambda o: (o[0], o[1]))
+        result[day] = (source, session)
     return result
 
 

@@ -38,7 +38,7 @@ from health_recs import (
 )
 
 SERVER_NAME = 'apple-health'
-SERVER_VERSION = '2.4.0'
+SERVER_VERSION = '2.5.0'
 
 # Protocol revisions this server is known to work against. If a client asks for
 # something else it still gets a usable session — the tool surface has not

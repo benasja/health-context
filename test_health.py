@@ -3172,6 +3172,31 @@ class TestHeartRateTimeline(unittest.TestCase):
             health_mcp.MAX_ROWS = old
         self.assertIn('(5-minute buckets would be more than 2 rows.)', text)
 
+    def test_an_unsupported_size_is_rounded_up_and_said_so(self):
+        text = self._call({'start': '2026-06-01', 'resolution_min': 7})
+        self.assertIn('10-minute buckets', text)
+        self.assertIn('(7 minutes is not a supported size; the nearest larger one is used.)', text)
+        self.assertNotIn('more than', text)
+        self.assertIn('1440-minute buckets', self._call({'start': '2026-06-01', 'resolution_min': 5000}))
+
+    def test_a_rounded_size_that_is_still_too_many_rows_names_the_rounded_one(self):
+        old = health_mcp.MAX_ROWS
+        health_mcp.MAX_ROWS = 2
+        try:
+            text = self._call({'start': '2026-06-01', 'resolution_min': 7})
+        finally:
+            health_mcp.MAX_ROWS = old
+        self.assertIn('(10-minute buckets would be more than 2 rows.)', text)
+
+    def test_a_range_too_long_even_for_day_buckets_says_so(self):
+        old = health_mcp.MAX_ROWS
+        health_mcp.MAX_ROWS = 0
+        try:
+            text = self._call({'start': '2026-06-01'})
+        finally:
+            health_mcp.MAX_ROWS = old
+        self.assertIn('(Even 1440-minute buckets are more than 0 rows; a shorter range shows more.)', text)
+
     def test_a_build_from_before_it_existed_says_so(self):
         os.remove(os.path.join(self.dir, 'hr_timeline.csv'))
         self.assertIn('no heart-rate timeline', self._call({}))

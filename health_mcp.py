@@ -1186,8 +1186,14 @@ def _hr_timeline(data: HealthData, args: dict[str, Any]) -> str:
 
     total = sum(b['samples'] for b in buckets)
     lines = [f'**Heart rate {first} to {last}**, {resolution}-minute buckets, {total:,} readings.']
-    if resolution != wanted:
-        lines[0] += f' ({wanted}-minute buckets would be more than {MAX_ROWS} rows.)'
+    # Say why the size differs from the one asked for: rounding to a supported
+    # size is not the same as having too many rows for it.
+    if len(groups) > MAX_ROWS:
+        lines[0] += f' (Even {resolution}-minute buckets are more than {MAX_ROWS} rows; a shorter range shows more.)'
+    elif resolution != choices[0]:
+        lines[0] += f' ({choices[0]}-minute buckets would be more than {MAX_ROWS} rows.)'
+    elif resolution != wanted:
+        lines[0] += f' ({wanted} minutes is not a supported size; the nearest larger one is used.)'
     # From the five-minute rows, so a coarse bucket spanning a night and a
     # morning doesn't count the morning as sleep.
     by_context: dict[str, list[dict[str, str]]] = {}

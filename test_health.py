@@ -3202,5 +3202,92 @@ class TestHeartRateTimeline(unittest.TestCase):
         self.assertIn('no heart-rate timeline', self._call({}))
 
 
+class TestRecommendations(unittest.TestCase):
+    """Suggestions kept with their evidence, and checked against the days since."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        today = date.today()
+        self.start = today - timedelta(days=20)
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['date', 'resting_hr', 'sleep_asleep_hours'])
+            for i in range(60, 0, -1):
+                d = today - timedelta(days=i)
+                # Resting HR 60/62 before the start, 56/57 after; sleep flat throughout.
+                rhr = (60 + (i % 2) * 2) if d < self.start else (56 + i % 2)
+                w.writerow([d.isoformat(), rhr, 7 + 0.1 * (i % 3 - 1)])
+        self.data = HealthData(self.dir)
+
+    def _call(self, name, args, data=None):
+        return health_mcp.HANDLERS[name](data or self.data, args)
+
+    def _recommend(self, start=None, **extra):
+        return self._call('health_recommend', {
+            'text': 'Lights out by 23:30 on weeknights', 'why': 'Resting HR is 4 bpm higher after late nights',
+            'judge_by': [{'metric': 'resting_hr', 'better': 'down'},
+                         {'metric': 'sleep_asleep_hours', 'better': 'up'}],
+            'start': (start or self.start).isoformat(), **extra})
+
+    def test_a_suggestion_is_recorded_with_its_baseline_and_judged_later(self):
+        text = self._recommend()
+        self.assertIn('Recorded **rec-1**', text)
+        self.assertIn('resting_hr averaged 61 over 28 days', text)
+        listing = self._call('health_recommendations', {})
+        self.assertIn('suggested (due)', listing)
+        self.assertIn('resting_hr better (61 → 56.5)', listing)
+        self.assertIn('sleep_asleep_hours no clear change', listing)
+
+    def test_the_log_outlives_the_session_and_ids_keep_counting(self):
+        self._recommend()
+        again = HealthData(self.dir)
+        self.assertIn('rec-1', self._call('health_recommendations', {}, again))
+        self.assertIn('Recorded **rec-2**', self._recommend())
+
+    def test_following_it_or_not_is_kept_with_notes(self):
+        self._recommend()
+        self.assertEqual(self._call('health_recommendation_update', {'id': 'rec-1', 'status': 'following'}),
+                         'rec-1 is now following.')
+        self._call('health_recommendation_update',
+                   {'id': 'rec-1', 'status': 'not following', 'note': 'late shifts this week'})
+        detail = self._call('health_recommendations', {'id': 'rec-1'})
+        self.assertIn('Status: not following', detail)
+        self.assertIn('not following: late shifts this week', detail)
+        self.assertIn("didn't follow it", detail)
+        self.assertIn('No suggestion rec-9', self._call('health_recommendation_update', {'id': 'rec-9', 'note': 'x'}))
+        self.assertIn('rec-1', self._call('health_recommendations', {'status': 'not following'}))
+        self.assertIn('No suggestions with status open', self._call('health_recommendations', {'status': 'open'}))
+
+    def test_too_early_until_enough_days_have_passed(self):
+        self._recommend(start=date.today() - timedelta(days=2))
+        listing = self._call('health_recommendations', {})
+        self.assertIn('resting_hr too early', listing)
+        self.assertNotIn('(due)', listing)
+
+    def test_an_unknown_metric_is_refused_and_nothing_written(self):
+        text = self._call('health_recommend', {'text': 'x', 'why': 'y',
+                                               'judge_by': [{'metric': 'resting_heart', 'better': 'down'}]})
+        self.assertIn('Unknown metric `resting_heart`', text)
+        self.assertFalse(os.path.exists(self.data.recs.path))
+
+    def test_the_overview_points_at_suggestions_due_for_review(self):
+        self._recommend()
+        self.assertIn('Suggestions log: 1 open, 1 due for review (rec-1)', self._call('health_overview', {}))
+
+    def test_a_torn_last_line_does_not_lose_the_rest(self):
+        self._recommend()
+        with open(self.data.recs.path, 'a') as f:
+            f.write('{"event": "upd')
+        self.assertIn('rec-1', self._call('health_recommendations', {}))
+
+    def test_the_log_sits_beside_the_snapshots_of_a_sync_folder(self):
+        import health_recs
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, 'snapshots', 'a'))
+        os.symlink(os.path.join(root, 'snapshots', 'a'), os.path.join(root, 'current'))
+        self.assertEqual(health_recs.state_dir_for(os.path.join(root, 'current')), root)
+        self.assertEqual(health_recs.state_dir_for(self.dir), os.path.abspath(self.dir))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

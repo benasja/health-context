@@ -290,6 +290,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 | `convert_health_data.py` | CLI entry point, CDA and ECG handling |
 | `health_bridge_import.py` | Reads a Health Bridge receiver's database in place of an export |
 | `health_hr_timeline.py` | Heart rate through the day in 5-minute buckets, with sleep and workout context |
+| `health_recs.py` | The suggestions log: kept as events, judged against the weeks before |
 | `health_strength.py` | Sets logged in Wariden, from the receiver, into the strength CSVs |
 | `health_sync.py` | Unattended rebuild loop for a receiver, with atomic snapshots |
 | `health_mcp.py` | MCP server over the generated files |
@@ -298,7 +299,7 @@ python3 convert_health_data.py --data-dir /tmp/fx
 
 Rather than pasting `llm_context.md` into a chat, let the assistant query your
 data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
-server exposing 18 tools over stdio — still zero dependencies, still entirely
+server exposing 21 tools over stdio — still zero dependencies, still entirely
 local, nothing uploaded anywhere.
 
 ```
@@ -361,6 +362,19 @@ Restart the client afterwards.
 | `health_context_pack` | The whole briefing |
 | `health_profile` | Your goals and constraints, if you wrote any down |
 | `health_data_quality` | Wear rates, coverage, excluded artifacts |
+| `health_recommend` | Record a suggestion, the evidence for it and the metrics that should move |
+| `health_recommendations` | Earlier suggestions, whether they were followed, and what the data did since |
+| `health_recommendation_update` | Whether a suggestion is being followed, with a note |
+
+The last three are the only ones that write anything. A chat's advice usually
+ends with the chat: "lights out by 23:30" is given, maybe followed, and never
+checked. `health_recommend` keeps it with its evidence and the metrics that
+should move (resting HR down, deep sleep up), and `health_recommendations`
+later compares the days since it started with the four weeks before, calling a
+change better or worse only when it is larger than the day-to-day noise. It
+can't tell what caused the change, and says so. The log is an append-only
+`recommendations.jsonl` beside the snapshots (or in the data folder), outside
+anything a rebuild replaces; `--state-dir` puts it elsewhere.
 
 Every answer starts with one line saying how fresh the data is (when the phone
 last synced, the newest record, when it was rebuilt) and, if today is

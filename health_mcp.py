@@ -28,8 +28,17 @@ from datetime import date, datetime
 from typing import Any
 from collections.abc import Callable
 
+from health_recs import (
+    DEFAULT_BASELINE_DAYS,
+    DEFAULT_REVIEW_DAYS,
+    STATUSES,
+    RecommendationLog,
+    judge,
+    state_dir_for,
+)
+
 SERVER_NAME = 'apple-health'
-SERVER_VERSION = '2.3.0'
+SERVER_VERSION = '2.4.0'
 
 # Protocol revisions this server is known to work against. If a client asks for
 # something else it still gets a usable session — the tool surface has not
@@ -107,9 +116,12 @@ class HealthData:
         'status': 'data_status.json',
     }
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, state_dir: str | None = None):
         self.root = os.path.abspath(data_dir)
         self.dir = os.path.realpath(self.root)
+        # The one thing written: suggestions and what came of them, kept apart
+        # from the outputs because those are replaced on every rebuild.
+        self.recs = RecommendationLog(state_dir or state_dir_for(data_dir))
         self._cache: dict[str, Any] = {}
         self._stamp = self._file_stamp()
 
@@ -547,7 +559,7 @@ def _overview(data: HealthData, _args: dict[str, Any]) -> str:
         # the two disagreeing.
         cut = context.find('## Distribution')
         head = context[:cut] if cut > 0 else context
-        return truncate(head.strip() + '\n\n' + _strength_note(data) + _freshness_note(data),
+        return truncate(head.strip() + '\n\n' + _strength_note(data) + _recs_note(data) + _freshness_note(data),
                         'Use health_context_pack for specific sections.')
     return _fallback_overview(data)
 
@@ -561,6 +573,17 @@ def _strength_note(data: HealthData) -> str:
     return (f'_Strength log from Wariden: {len(sessions)} sessions, latest {last.get("date", "")}'
             f'{program}. Exercises, sets, reps and weights: health_strength_sessions, '
             'health_strength_session, health_strength_progress._\n\n')
+
+
+def _recs_note(data: HealthData) -> str:
+    recs = data.recs.all()
+    open_recs = [r for r in recs if r.status in ('suggested', 'following')]
+    if not open_recs:
+        return ''
+    due = [r.id for r in open_recs if r.is_due(date.today())]
+    due_text = f", {len(due)} due for review ({', '.join(due)})" if due else ''
+    return (f'_Suggestions log: {len(open_recs)} open{due_text}. Before suggesting something new, '
+            'check what was already tried and whether it worked: health_recommendations._\n\n')
 
 
 def _freshness_note(data: HealthData) -> str:
@@ -582,7 +605,7 @@ def _fallback_overview(data: HealthData) -> str:
         wear[row.get('wear_class', 'none')] = wear.get(row.get('wear_class', 'none'), 0) + 1
     return (f'{len(dates)} days, {min(dates).isoformat()} to {max(dates).isoformat()}.\n'
             + 'Wear: ' + ', '.join(f'{v} {k}' for k, v in wear.items())
-            + '\n\n' + _strength_note(data) + _freshness_note(data))
+            + '\n\n' + _strength_note(data) + _recs_note(data) + _freshness_note(data))
 
 
 @tool(
@@ -1335,6 +1358,157 @@ def _quality(data: HealthData, _args: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Suggestions log
+# ---------------------------------------------------------------------------
+
+JUDGE_BY_PROP = {
+    'type': 'array', 'minItems': 1,
+    'description': 'The metrics that should move if the suggestion works, and which way is better',
+    'items': {'type': 'object', 'required': ['metric', 'better'],
+              'properties': {'metric': METRIC_PROP,
+                             'better': {'type': 'string', 'enum': ['up', 'down']}}},
+}
+
+
+def _outcomes(data: HealthData, rec) -> list:
+    last = data.freshness()[0] or date.today()
+    return [judge(data.series(j['metric']), rec, j['metric'], j['better'], last) for j in rec.judge_by]
+
+
+def _outcome_text(o) -> str:
+    if o.verdict in ('too early', 'no baseline'):
+        return f"{o.metric} {o.verdict}"
+    return f"{o.metric} {o.verdict} ({fmt(o.before_mean, 1)} → {fmt(o.after_mean, 1)})"
+
+
+@tool(
+    'health_recommend',
+    'Record a suggestion made to the person from their data, so a later conversation can '
+    'check whether it worked. Use it whenever you give a concrete, trackable suggestion '
+    '(a bedtime, a training change, cutting late caffeine), after they agree to try it. '
+    'Name the metrics that should move and which way. The days from start on are later '
+    'compared with the weeks before.',
+    obj({'text': {'type': 'string', 'description': 'The suggestion, as told to the person'},
+         'why': {'type': 'string', 'description': 'The evidence it rests on, with numbers'},
+         'judge_by': JUDGE_BY_PROP,
+         'start': {'type': 'string', 'description': 'YYYY-MM-DD the person starts; default today'},
+         'review_days': {'type': 'integer',
+                         'description': f'Days to try it before judging (default {DEFAULT_REVIEW_DAYS})'},
+         'baseline_days': {'type': 'integer',
+                           'description': f'Days before the start to compare with (default {DEFAULT_BASELINE_DAYS})'}},
+        ['text', 'why', 'judge_by']),
+)
+def _recommend(data: HealthData, args: dict[str, Any]) -> str:
+    known = set(data.metrics())
+    judge_by = []
+    for j in args.get('judge_by') or []:
+        metric, better = str(j.get('metric', '')), str(j.get('better', ''))
+        if metric not in known:
+            return f'Unknown metric `{metric}`. health_list_metrics lists them.'
+        if better not in ('up', 'down'):
+            return f'`better` for {metric} must be "up" or "down".'
+        judge_by.append({'metric': metric, 'better': better})
+    if not judge_by:
+        return 'Name at least one metric to judge it by, in judge_by.'
+    start = parse_date(args.get('start'), date.today())
+    review_days = min(max(int(args.get('review_days') or DEFAULT_REVIEW_DAYS), 3), 365)
+    baseline_days = min(max(int(args.get('baseline_days') or DEFAULT_BASELINE_DAYS), 7), 365)
+    try:
+        rec = data.recs.add(str(args['text']).strip(), str(args.get('why') or '').strip(), judge_by,
+                            start, review_days, baseline_days)
+    except OSError as exc:
+        return f'Could not write the suggestions log at {data.recs.path}: {exc}'
+    baseline = '; '.join(
+        f"{o.metric} averaged {fmt(o.before_mean, 1)} over {o.before_days} days" if o.before_days
+        else f"{o.metric} has no values in the {baseline_days} days before"
+        for o in _outcomes(data, rec))
+    return (f'Recorded **{rec.id}**, starting {rec.start.isoformat()}, to review on '
+            f'{rec.review_on.isoformat()}. Baseline: {baseline}. '
+            "When the person says whether they're doing it, record it with "
+            'health_recommendation_update.')
+
+
+@tool(
+    'health_recommendations',
+    'Suggestions made in earlier conversations, whether the person followed them, and what '
+    'the data did since: each judged metric over the days since the start against the weeks '
+    'before. Check it before suggesting something new, and when one is due for review. '
+    'Better or worse means larger than the day-to-day noise before, not proof the suggestion '
+    'caused it.',
+    obj({'id': {'type': 'string', 'description': 'One suggestion in detail, e.g. rec-3'},
+         'status': {'type': 'string', 'enum': ['open', 'all', *STATUSES],
+                    'description': 'Filter; default all'}}),
+)
+def _recommendations(data: HealthData, args: dict[str, Any]) -> str:
+    recs = data.recs.all()
+    if not recs:
+        return 'No suggestions recorded yet. health_recommend records one.'
+    today = date.today()
+    if args.get('id'):
+        rec = next((r for r in recs if r.id == args['id']), None)
+        if rec is None:
+            return f"No suggestion {args['id']}. Recorded: {', '.join(r.id for r in recs)}."
+        day = (today - rec.start).days + 1
+        progress = (f'day {day} of {rec.review_days}' if 0 < day <= rec.review_days
+                    else 'not started' if day <= 0 else f'review was due {rec.review_on.isoformat()}')
+        out = [f'**{rec.id}: {rec.text}**',
+               f'Status: {rec.status}. Started {rec.start.isoformat()}, {progress}.',
+               f'Why: {rec.why}' if rec.why else '', '',
+               table(['metric', 'better', 'before', 'days', 'since', 'days', 'verdict'],
+                     [[o.metric, o.better, fmt(o.before_mean, 1), str(o.before_days),
+                       fmt(o.after_mean, 1), str(o.after_days), o.verdict] for o in _outcomes(data, rec)])]
+        if rec.notes:
+            out += ['', 'History:'] + [f'- {when[:10]}' + (f' {status}' if status else '')
+                                       + (f': {note}' if note else '') for when, status, note in rec.notes]
+        if rec.status == 'not following':
+            out += ['', "_They didn't follow it, so any change since isn't from this._"]
+        return '\n'.join(line for line in out if line is not None)
+
+    wanted = args.get('status') or 'all'
+    if wanted == 'open':
+        recs = [r for r in recs if r.status in ('suggested', 'following')]
+    elif wanted != 'all':
+        recs = [r for r in recs if r.status == wanted]
+    if not recs:
+        return f'No suggestions with status {wanted}.'
+    rows = []
+    for rec in recs[-MAX_ROWS:]:
+        text = rec.text if len(rec.text) <= 80 else rec.text[:77] + '...'
+        due = ' (due)' if rec.is_due(today) else ''
+        rows.append([rec.id, rec.start.isoformat(), text, rec.status + due,
+                     '; '.join(_outcome_text(o) for o in _outcomes(data, rec))])
+    return (table(['id', 'start', 'suggestion', 'status', 'since vs before'], rows)
+            + '\n\nOne in detail, with its evidence and history: health_recommendations with id.')
+
+
+@tool(
+    'health_recommendation_update',
+    "Record whether the person is following a suggestion, or that it ended, with a note in "
+    "their words (\"stopped after a week, too hard with late shifts\"). Whether it was "
+    "followed decides what its numbers mean.",
+    obj({'id': {'type': 'string', 'description': 'e.g. rec-3'},
+         'status': {'type': 'string', 'enum': STATUSES},
+         'note': {'type': 'string'}},
+        ['id']),
+)
+def _recommendation_update(data: HealthData, args: dict[str, Any]) -> str:
+    rec_id = str(args.get('id') or '')
+    if data.recs.get(rec_id) is None:
+        return f'No suggestion {rec_id}.'
+    status = args.get('status')
+    note = str(args.get('note') or '').strip()
+    if status is not None and status not in STATUSES:
+        return f"Status must be one of: {', '.join(STATUSES)}."
+    if not status and not note:
+        return 'Give a status, a note, or both.'
+    try:
+        rec = data.recs.update(rec_id, status, note or None)
+    except OSError as exc:
+        return f'Could not write the suggestions log at {data.recs.path}: {exc}'
+    return f'{rec.id} is now {rec.status}' + (f', noted: {note}' if note else '') + '.'
+
+
+# ---------------------------------------------------------------------------
 # JSON-RPC plumbing
 # ---------------------------------------------------------------------------
 
@@ -1465,6 +1639,9 @@ def main() -> None:
     )
     parser.add_argument('--data-dir', default='output',
                         help='Directory holding the generated CSVs (default: output)')
+    parser.add_argument('--state-dir',
+                        help='Where the suggestions log is kept (default: beside the snapshots '
+                             'for a health_sync.py folder, else the data dir)')
     parser.add_argument('--max-output-chars', type=int, default=DEFAULT_MAX_OUTPUT_CHARS,
                         help='Ceiling on a single tool result (default '
                              f'{DEFAULT_MAX_OUTPUT_CHARS}). Set ~6000 for a local model '
@@ -1478,7 +1655,7 @@ def main() -> None:
     global MAX_OUTPUT_CHARS
     MAX_OUTPUT_CHARS = max(1000, args.max_output_chars)
 
-    data = HealthData(args.data_dir)
+    data = HealthData(args.data_dir, args.state_dir)
 
     if args.print_config:
         print(client_config(args.data_dir))

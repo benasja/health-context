@@ -122,6 +122,10 @@ Without Docker, the same with `python3 ~/health-context/health_mcp.py
 A session that is already open picks up new data on its next question; nothing
 needs restarting.
 
+Suggestions recorded with `health_recommend` go in `recommendations.jsonl` in
+the output folder, beside `current` and `snapshots/`. A rebuild never touches
+it, and every session that connects, here or over SSH, shares the same log.
+
 ## How a rebuild works, and why
 
 Each rebuild writes a complete new folder under `snapshots/`, and only then

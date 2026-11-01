@@ -24,6 +24,13 @@ data_quality_report.txt
 coaching_types_usage.txt
 insights_report.md
 llm_context.md
+data_status.json
+workout_series.csv
+hr_timeline.csv
+strength_sets.csv
+strength_sessions.csv
+# Suggestions made from the data and what came of them
+recommendations.jsonl
 
 # health_sync.py's output folder layout
 snapshots/

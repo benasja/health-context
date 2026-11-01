@@ -297,6 +297,10 @@ class ExportData:
     mindful_minutes: dict[date, float] = field(default_factory=lambda: defaultdict(float))
     # Sets logged in Wariden (health_strength.StrengthSet), from a receiver only.
     strength_sets: list[Any] = field(default_factory=list)
+    # Steps per local five-minute bucket (start -> steps), from a receiver only.
+    # Kept apart from the records: the day's `steps` comes from the phone's daily
+    # total, and these only say when in the day the steps were taken.
+    step_buckets: dict[datetime, float] = field(default_factory=dict)
     first_seen: dict[str, date] = field(default_factory=dict)
     sources: Counter = field(default_factory=Counter)
     metric_sources: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))

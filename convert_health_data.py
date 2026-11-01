@@ -321,6 +321,8 @@ def _load_bridge(args: argparse.Namespace, data: ExportData):
           f'from the phone), {summary.sleep_stages:,} sleep stages, {summary.workouts:,} workouts')
     if summary.strength_sets:
         print(f'  Read {summary.strength_sets:,} strength sets logged in Wariden')
+    if summary.step_buckets:
+        print(f'  Read {summary.step_buckets:,} five-minute step counts')
     if summary.raw_replaced_by_daily_total:
         print(f'  Left out {summary.raw_replaced_by_daily_total:,} raw samples on days the phone '
               'already sent its own de-duplicated total for')

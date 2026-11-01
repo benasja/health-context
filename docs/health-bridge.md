@@ -235,11 +235,31 @@ so the files always match the app.
 
 Every `heart_rate` sample the receiver holds, not only those inside workouts,
 goes into `hr_timeline.csv`: one row per local five-minute bucket with the
-average, lowest and highest reading, how many readings there were, and the
-workout or sleep stage the bucket fell in. The MCP tool `health_hr_timeline`
-reads it for any span of days or hours, coarsening the buckets when the span is
-long. A bucket outside a workout or sleep has no label. The phone sends steps
-only as daily totals, so there is nothing to tell walking from sitting.
+average, lowest and highest reading, how many readings there were, the steps
+taken in it, and the workout or sleep stage the bucket fell in. The MCP tool
+`health_hr_timeline` reads it for any span of days or hours, coarsening the
+buckets when the span is long (steps are added up, heart rate is weighted by
+readings).
+
+The steps come from `steps_5min`, which Wariden sends beside the daily totals:
+one sample per five-minute bucket with steps, summed by HealthKit across iPhone
+and Watch like the daily total. They are kept out of the daily figures, whose
+`steps` stays the phone's daily total; the equivalence check's database holds
+them too, so CI proves they change nothing else. Outside workouts and sleep a bucket is
+labelled by its steps:
+
+| Label | Steps in the 5 minutes | Why |
+|---|---|---|
+| `walking` | 300 or more | 60 a minute on average: below that, stepping is incidental, and from 100 a minute it is a moderate walk. A walk that only clips a bucket reads as light activity. |
+| `light activity` | 20 to 299 | Moving about, or part of a walk |
+| `stationary` | under 20 | Sitting or standing still: the Watch counts a few steps from arm movement alone |
+
+The phone sends only buckets with steps, so on a day that has any five-minute
+step data a bucket it didn't send had none (0, `stationary`). A day with none
+at all (an export.xml, or before the phone started sending them) leaves both
+the steps and the label empty: unknown, not zero. A bucket with steps but no
+heart-rate reading still gets a row, with its heart-rate columns empty, so the
+steps of an hour add up.
 
 ## Which receiver versions work
 

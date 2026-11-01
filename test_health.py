@@ -2528,6 +2528,40 @@ class TestHealthBridgeImport(unittest.TestCase):
         _data, _summary, days = self._load()
         self.assertEqual(float(days['2026-06-03']['steps']), 1200.0)
 
+    def _step_bucket(self, start, steps):
+        end = (datetime.fromisoformat(start.replace('Z', '+00:00')) + timedelta(minutes=5))
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps_5min', start,
+                     end.strftime('%Y-%m-%dT%H:%M:%SZ'), steps, 'count',
+                     aggregation='sum', healthkit_object_kind='quantity', healthkit_statistics='cumulative_sum',
+                     interval_minutes='5', sample_kind='interval_aggregate')
+
+    def test_five_minute_steps_go_to_their_own_table_and_leave_the_days_steps_alone(self):
+        # They carry StepCount's identifier. Read as records they would be added
+        # to the day's steps, or taken for raw samples on a day without a total.
+        from zoneinfo import ZoneInfo
+        vilnius = ZoneInfo('Europe/Vilnius')
+        self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
+                     '2026-05-31T21:00:00Z', '2026-06-01T21:00:00Z', 9000.0, 'count',
+                     aggregation='daily_sum', healthkit_query='HKStatisticsCollectionQuery',
+                     calendar_day='2026-06-01', time_zone_identifier='Europe/Vilnius')
+        self._step_bucket('2026-06-01T06:00:00Z', 420.0)
+        self._step_bucket('2026-06-01T06:05:00Z', 35.5)
+        self._step_bucket('2026-06-03T06:00:00Z', 600.0)
+        data, summary, days = self._load()
+        self.assertEqual(float(days['2026-06-01']['steps']), 9000.0)
+        self.assertEqual(days.get('2026-06-03', {}).get('steps', ''), '')
+        self.assertEqual(summary.step_buckets, 3)
+        self.assertEqual(summary.raw_replaced_by_daily_total, 0)
+        self.assertEqual(summary.daily_totals, 1)
+        self.assertEqual(data.type_counts['HKQuantityTypeIdentifierStepCount'], 1)
+        self.assertEqual([r.type for r in data.records], ['HKQuantityTypeIdentifierStepCount'])
+        # Local time: 06:00 UTC is 09:00 in Vilnius in June.
+        self.assertEqual(data.step_buckets, {
+            datetime(2026, 6, 1, 9, 0, tzinfo=vilnius): 420.0,
+            datetime(2026, 6, 1, 9, 5, tzinfo=vilnius): 35.5,
+            datetime(2026, 6, 3, 9, 0, tzinfo=vilnius): 600.0,
+        })
+
     def test_a_daily_total_stays_on_the_day_the_phone_counted_it_on(self):
         # Even when --timezone differs from the phone's, calendar_day decides.
         self._sample('HKQuantityTypeIdentifierStepCount', 'steps',
@@ -3200,6 +3234,98 @@ class TestHeartRateTimeline(unittest.TestCase):
     def test_a_build_from_before_it_existed_says_so(self):
         os.remove(os.path.join(self.dir, 'hr_timeline.csv'))
         self.assertIn('no heart-rate timeline', self._call({}))
+
+
+class TestHeartRateTimelineSteps(unittest.TestCase):
+    """Five-minute steps beside heart rate, and what they say outside sleep and workouts."""
+
+    def setUp(self):
+        import health_hr_timeline
+        self.timeline = health_hr_timeline
+        hr = lambda t, bpm: rec(  # noqa: E731
+            'HKQuantityTypeIdentifierHeartRate', bpm, 'Apple Watch', t, t, unit='count/min')
+        data = ExportData()
+        data.records = [
+            sleep_rec('Apple Watch', dt(2026, 6, 1, 2, 0), dt(2026, 6, 1, 3, 0), 'AsleepDeep'),
+            hr(dt(2026, 6, 1, 2, 1), 50.0),
+            hr(dt(2026, 6, 1, 9, 0), 72.0),      # no steps sent for this bucket: none taken
+            hr(dt(2026, 6, 1, 10, 2), 110.0),
+            hr(dt(2026, 6, 1, 11, 1), 85.0),
+            hr(dt(2026, 6, 1, 17, 10), 140.0),   # in a ride, which wins over its steps
+            hr(dt(2026, 6, 2, 9, 0), 70.0),      # a day with no step data at all
+        ]
+        data.workouts = [TestWorkoutHeartRateZones._workout(None, dt(2026, 6, 1, 17, 0), dt(2026, 6, 1, 18, 0))]
+        for moment, steps in [(dt(2026, 6, 1, 10, 2), 520.0), (dt(2026, 6, 1, 10, 0), 300.0),
+                              (dt(2026, 6, 1, 11, 0), 120.4), (dt(2026, 6, 1, 12, 0), 400.0),
+                              (dt(2026, 6, 1, 17, 10), 800.0)]:
+            self.assertTrue(health_hr_timeline.add_step_bucket(data, moment, steps))
+        self.assertFalse(health_hr_timeline.add_step_bucket(data, dt(2026, 6, 1, 13, 0), float('nan')))
+        self.rows = health_hr_timeline.build_hr_timeline(data)
+        self.dir = tempfile.mkdtemp()
+        health_hr_timeline.write_hr_timeline(self.dir, data)
+        with open(os.path.join(self.dir, 'daily_metrics.csv'), 'w', newline='') as f:
+            csv.writer(f).writerows([['date', 'steps'], ['2026-06-02', '5000']])
+        self.data = HealthData(self.dir)
+
+    def _call(self, args):
+        return health_mcp.HANDLERS['health_hr_timeline'](self.data, args)
+
+    def test_thresholds(self):
+        label = self.timeline.step_context
+        self.assertEqual([label(None), label(0), label(19.9), label(20), label(299), label(300), label(2000)],
+                         ['', 'stationary', 'stationary', 'light activity', 'light activity', 'walking', 'walking'])
+
+    def test_a_bucket_keeps_the_larger_count_on_its_five_minute_edge(self):
+        self.assertEqual(self.rows[2]['time'], '2026-06-01 10:00 +0300')
+        self.assertEqual(self.rows[2]['steps'], 520)
+
+    def test_steps_and_labels_per_bucket(self):
+        self.assertEqual(
+            [(r['time'][:16], r['avg_hr'], r['samples'], r['steps'], r['context']) for r in self.rows],
+            [('2026-06-01 02:00', 50.0, 1, 0, 'sleep: deep'),
+             ('2026-06-01 09:00', 72.0, 1, 0, 'stationary'),
+             ('2026-06-01 10:00', 110.0, 1, 520, 'walking'),
+             ('2026-06-01 11:00', 85.0, 1, 120, 'light activity'),
+             # Steps without a reading still get a row, so the day's steps add up.
+             ('2026-06-01 12:00', '', 0, 400, 'walking'),
+             ('2026-06-01 17:10', 140.0, 1, 800, 'workout: Cycling'),
+             # No five-minute step data that day: unknown, not zero.
+             ('2026-06-02 09:00', 70.0, 1, '', '')])
+        with open(os.path.join(self.dir, 'hr_timeline.csv'), newline='') as f:
+            written = list(csv.DictReader(f))
+        self.assertEqual(written[4], {'time': '2026-06-01 12:00 +0300', 'avg_hr': '', 'min_hr': '', 'max_hr': '',
+                                      'samples': '0', 'steps': '400', 'context': 'walking', 'source': ''})
+
+    def test_a_day_with_steps_averages_by_activity_and_shows_them(self):
+        text = self._call({'start': '2026-06-01'})
+        self.assertIn('5 readings', text)
+        self.assertIn('lowest 50, highest 140, light activity avg 85, sleep avg 50, stationary avg 72, '
+                      'walking avg 110, workout avg 140 bpm.', text)
+        self.assertIn('walking 300+, light activity 20-299, stationary under 20', text)
+        self.assertNotIn('"other"', text)
+        self.assertIn('| time | avg | min | max | steps | context |', text)
+        self.assertIn('| 09:00 | 72 | 72 | 72 | 0 | stationary |', text)
+        self.assertIn('| 12:00 |  |  |  | 400 | walking |', text)
+
+    def test_without_step_data_other_is_explained_and_there_is_no_steps_column(self):
+        text = self._call({'start': '2026-06-02'})
+        self.assertIn('other avg 70 bpm.', text)
+        self.assertIn('"other" is outside sleep and workouts at times with no 5-minute step data', text)
+        self.assertNotIn('steps', text.split('\n\n', 1)[1])
+        self.assertNotIn('walking 300+', text)
+
+    def test_a_range_with_and_without_step_data_says_both(self):
+        text = self._call({'start': '2026-06-01', 'end': '2026-06-02'})
+        self.assertIn('walking avg 110', text)
+        self.assertIn('"other" is outside sleep and workouts at times with no 5-minute step data', text)
+
+    def test_coarser_buckets_add_the_steps_up(self):
+        text = self._call({'start': '2026-06-01', 'resolution_min': 1440, 'format': 'csv'})
+        # (50 + 72 + 110 + 85 + 140) / 5 readings; 0 + 0 + 520 + 120 + 400 + 800 steps, no separator.
+        self.assertIn('```csv\ntime,avg,min,max,steps,context\n00:00,91,50,140,1840,', text)
+
+    def test_steps_alone_are_not_heart_rate(self):
+        self.assertIn('No heart-rate readings', self._call({'start': '2026-06-01 12:00', 'end': '2026-06-01 12:04'}))
 
 
 class TestRecommendations(unittest.TestCase):

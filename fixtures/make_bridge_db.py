@@ -15,6 +15,11 @@ them -- because the differences are the whole point of the importer:
 * sleep as sessions holding stage intervals, attributed to the phone app;
 * the original device kept in `healthkit_source_name`, as the app does.
 
+Steps are also sent per five minutes (`steps_5min`), the way Wariden sends
+them: one sample per UTC five-minute bucket with steps, from the raw samples
+spread over the buckets they cover and merged across devices by keeping the
+larger count, as HealthKit's statistics query does in effect.
+
 Stand hours and the cycling types (power, cadence, speed, FTP) are included
 too. The Health Bridge app does not send them, but the receiver stores them
 from any client that does, so this covers a client that sends everything:
@@ -222,6 +227,23 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
         sample(hk, utc(start), utc(end), to_bridge_value(hk, value, unit), meta)
         counts['raw_samples'] += 1
 
+    # Steps per five minutes, as Wariden sends them alongside the daily total.
+    conn.execute("insert or ignore into health_types (type_code, display_name, category, default_unit, "
+                 "sensitivity) values ('steps_5min', 'Step count per 5 minutes (Wariden)', 'activity', "
+                 "'count', 'low')")
+    conn.execute("insert into health_type_aliases (type_code, alias) values ('steps_5min', 'WaridenStepCount5Min')")
+    for start, steps in sorted(step_buckets(raw).items()):
+        serial += 1
+        conn.execute('insert into samples (source_id, type_code, client_record_id, start_time, '
+                     'end_time, value, unit, metadata_json) values (?, ?, ?, ?, ?, ?, ?, ?)',
+                     (source_id, 'steps_5min', 'hk-steps-5min-' + start.strftime('%Y%m%dt%H%M%Sz'),
+                      utc(start), utc(start + FIVE_MINUTES), steps, 'count',
+                      json.dumps({'aggregation': 'sum', 'healthkit_identifier': Q + 'StepCount',
+                                  'healthkit_object_kind': 'quantity', 'healthkit_statistics': 'cumulative_sum',
+                                  'interval_minutes': '5', 'sample_kind': 'interval_aggregate'},
+                                 sort_keys=True)))
+        counts['step_buckets'] += 1
+
     # Stand hours: a category, so HealthKit's number rather than the export's label.
     for start, end, label, source_name in _stand_hours(export_xml):
         serial += 1
@@ -279,6 +301,38 @@ def build(export_xml: str, out_path: str, tz_name: str, schema_dir: str | None =
     conn.commit()
     conn.close()
     return dict(counts)
+
+
+FIVE_MINUTES = timedelta(minutes=5)
+
+
+def step_buckets(raw) -> dict[datetime, float]:
+    """Raw step samples as five-minute UTC buckets, the way Wariden sends them.
+
+    Each sample is spread over the buckets it covers in proportion to time, as
+    HealthKit's statistics query does; devices are merged by keeping each
+    bucket's larger count (the Watch's, in the demo). Buckets without steps are
+    left out, and counts rounded to hundredths, as the app sends them.
+    """
+    per_source: dict[str, dict[datetime, float]] = defaultdict(lambda: defaultdict(float))
+    for start, end, value, _unit, hk, source_name, _device in raw:
+        if hk != Q + 'StepCount' or value <= 0:
+            continue
+        start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+        span = (end - start).total_seconds()
+        bucket = start.replace(minute=start.minute - start.minute % 5, second=0, microsecond=0)
+        if span <= 0:
+            per_source[source_name][bucket] += value
+            continue
+        while bucket < end:
+            overlap = (min(end, bucket + FIVE_MINUTES) - max(start, bucket)).total_seconds()
+            per_source[source_name][bucket] += value * overlap / span
+            bucket += FIVE_MINUTES
+    merged: dict[datetime, float] = {}
+    for buckets in per_source.values():
+        for bucket, steps in buckets.items():
+            merged[bucket] = max(steps, merged.get(bucket, 0.0))
+    return {bucket: round(steps, 2) for bucket, steps in merged.items() if round(steps, 2) > 0}
 
 
 def _all_raw(export_xml: str):

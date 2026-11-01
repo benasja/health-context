@@ -1149,19 +1149,33 @@ def _hr_rows(path: str, first: str, last: str) -> list[dict[str, str]]:
     return rows
 
 
+def _has_hr(row: dict[str, str]) -> bool:
+    # A bucket with steps but no heart-rate reading has its heart-rate columns empty.
+    return bool(row.get('avg_hr'))
+
+
 def _hr_group(start: str, rows: list[dict[str, str]]) -> dict[str, Any]:
-    weights = [int(r['samples'] or 1) for r in rows]
+    """Buckets merged: heart rate weighted by readings, steps added up.
+
+    Steps are None when no bucket in the group has step data, so "unknown" is
+    not shown as zero. A group of step-only buckets has no heart rate (None).
+    """
+    hr = [r for r in rows if _has_hr(r)]
+    weights = [int(r['samples'] or 1) for r in hr]
     contexts: dict[str, int] = {}
     sources: dict[str, int] = {}
-    for r, w in zip(rows, weights, strict=True):
+    # Contexts are weighted by readings; a group without any by its buckets.
+    for r, w in zip(hr or rows, weights or [1] * len(rows), strict=True):
         contexts[r.get('context', '')] = contexts.get(r.get('context', ''), 0) + w
         sources[r.get('source', '')] = sources.get(r.get('source', ''), 0) + w
+    steps = [int(r['steps']) for r in rows if r.get('steps')]
     return {
         'time': start,
-        'avg': sum(float(r['avg_hr']) * w for r, w in zip(rows, weights, strict=True)) / sum(weights),
-        'min': min(float(r['min_hr']) for r in rows),
-        'max': max(float(r['max_hr']) for r in rows),
+        'avg': sum(float(r['avg_hr']) * w for r, w in zip(hr, weights, strict=True)) / sum(weights) if hr else None,
+        'min': min(float(r['min_hr']) for r in hr) if hr else None,
+        'max': max(float(r['max_hr']) for r in hr) if hr else None,
         'samples': sum(weights),
+        'steps': sum(steps) if steps else None,
         'context': max(contexts, key=contexts.get),
         'source': max(sources, key=sources.get),
     }
@@ -1170,9 +1184,10 @@ def _hr_group(start: str, rows: list[dict[str, str]]) -> dict[str, Any]:
 @tool(
     'health_hr_timeline',
     'Heart rate through the day, from every Watch reading: average, lowest and highest per '
-    'bucket, each labelled with the sleep stage or workout it fell in. Use it to graph a day, a '
-    'night or a stretch of days. Times are local. Buckets are 5 minutes unless a coarser '
-    'resolution is asked for, or needed to fit (at most 400 rows).',
+    'bucket, and the steps taken in it, each labelled with the sleep stage or workout it fell in, '
+    'or else walking, light activity or stationary from its steps. Use it to graph a day, a night '
+    'or a stretch of days. Times are local. Buckets are 5 minutes unless a coarser resolution is '
+    'asked for, or needed to fit (at most 400 rows).',
     obj({'start': {'type': 'string', 'description': 'YYYY-MM-DD or YYYY-MM-DD HH:MM; default the latest day'},
          'end': {'type': 'string', 'description': 'YYYY-MM-DD (whole day) or YYYY-MM-DD HH:MM; default the start day'},
          'resolution_min': {'type': 'integer', 'description': 'Bucket minutes: 5, 10, 15, 30, 60 ... 1440'},
@@ -1192,7 +1207,7 @@ def _hr_timeline(data: HealthData, args: dict[str, Any]) -> str:
     if last < first:
         return 'The end is before the start.'
     rows = _hr_rows(path, first, last)
-    if not rows:
+    if not any(_has_hr(r) for r in rows):
         return f'No heart-rate readings between {first} and {last}.'
 
     wanted = int(args.get('resolution_min') or 5)
@@ -1221,19 +1236,37 @@ def _hr_timeline(data: HealthData, args: dict[str, Any]) -> str:
     # morning doesn't count the morning as sleep.
     by_context: dict[str, list[dict[str, str]]] = {}
     for r in rows:
+        if not _has_hr(r):
+            continue
         kind = r['context'].split(':')[0] if r.get('context') else 'other'
         by_context.setdefault(kind, []).append(r)
-    summary = [f"lowest {fmt(min(b['min'] for b in buckets), 0)}, highest {fmt(max(b['max'] for b in buckets), 0)}"]
+    with_hr = [b for b in buckets if b['avg'] is not None]
+    summary = [f"lowest {fmt(min(b['min'] for b in with_hr), 0)}, highest {fmt(max(b['max'] for b in with_hr), 0)}"]
     for kind, group in sorted(by_context.items()):
         summary.append(f"{kind} avg {fmt(_hr_group('', group)['avg'], 0)}")
-    lines.append(', '.join(summary) + ' bpm. "other" is outside sleep and workouts: walking and resting '
-                 'can\'t be told apart, because steps arrive only as daily totals.')
+    note = ', '.join(summary) + ' bpm.'
+    if by_context.keys() & {'walking', 'light activity', 'stationary'}:
+        from health_hr_timeline import STATIONARY_STEPS, WALKING_STEPS
+        note += (f' Outside sleep and workouts, by the steps in each 5 minutes: walking {WALKING_STEPS}+, '
+                 f'light activity {STATIONARY_STEPS}-{WALKING_STEPS - 1}, stationary under {STATIONARY_STEPS}.')
+    if 'other' in by_context:
+        note += (' "other" is outside sleep and workouts at times with no 5-minute step data, so walking '
+                 'and resting can\'t be told apart there.')
+    lines.append(note)
 
     one_day = first[:10] == last[:10]
-    several_sources = len({b['source'] for b in buckets}) > 1
-    headers = ['time', 'avg', 'min', 'max', 'context'] + (['source'] if several_sources else [])
-    table_rows = [[b['time'][11:] if one_day else b['time'], fmt(b['avg'], 0), fmt(b['min'], 0),
-                   fmt(b['max'], 0), b['context']] + ([b['source']] if several_sources else [])
+    several_sources = len({b['source'] for b in with_hr}) > 1
+    any_steps = any(b['steps'] is not None for b in buckets)
+    headers = (['time', 'avg', 'min', 'max'] + (['steps'] if any_steps else []) + ['context']
+               + (['source'] if several_sources else []))
+
+    def cell(value: float | None) -> str:
+        return '' if value is None else fmt(value, 0)
+
+    table_rows = [[b['time'][11:] if one_day else b['time'], cell(b['avg']), cell(b['min']), cell(b['max'])]
+                  # Steps without a thousands separator, which would split a csv cell.
+                  + (['' if b['steps'] is None else str(b['steps'])] if any_steps else []) + [b['context']]
+                  + ([b['source']] if several_sources else [])
                   for b in buckets]
     if args.get('format') == 'csv':
         body = '```csv\n' + '\n'.join(','.join(row) for row in [headers] + table_rows) + '\n```'

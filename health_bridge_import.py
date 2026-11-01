@@ -25,6 +25,10 @@ What has to be translated, and why each one matters:
   raw Watch samples win the interval de-duplication and the merged total be
   thrown away. Where a day has the phone's total, the raw samples for that type
   and day are skipped -- the same rule the receiver's own daily summary uses.
+* **Five-minute steps.** Wariden also sends steps per five minutes
+  (`steps_5min`). They go into their own table, never into the records: the
+  day's step count stays the phone's daily total, and these only say when in
+  the day the steps were taken (see health_hr_timeline).
 * **Units.** The bridge sends percentages as 0-100; Apple's export, which this
   project was built against, writes fractions. Left alone, SpO2 would read
   9,700%. Heart rate arrives as "bpm", minutes as "minutes", walking speed in
@@ -56,6 +60,7 @@ from health_coaching import (
     Workout,
     add_parsed_record,
 )
+from health_hr_timeline import STEP_BUCKET_TYPE, add_step_bucket
 from health_strength import STRENGTH_SET_TYPE, strength_set
 
 # The tables and columns read here. Anything missing means the receiver's
@@ -157,6 +162,7 @@ class BridgeSummary:
     sleep_stages: int = 0
     workouts: int = 0
     strength_sets: int = 0
+    step_buckets: int = 0
     unmapped_types: Counter = field(default_factory=Counter)
     not_parsed_types: Counter = field(default_factory=Counter)
     # When the receiver last stored something from the phone (UTC, ISO), so a
@@ -377,7 +383,7 @@ def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],
     for type_code, start_raw, end_raw, _v, _u, meta_raw, _n, _c in conn.execute(
             query + "where s.metadata_json like '%daily_sum%' or s.metadata_json like '%HKStatisticsCollectionQuery%'"):
         meta = _metadata(meta_raw)
-        if not is_daily_total(meta):
+        if type_code == STEP_BUCKET_TYPE or not is_daily_total(meta):
             continue
         hk = meta.get('healthkit_identifier') or aliases.get(type_code)
         start, _end = _local_day_span(meta, parse_utc(start_raw), parse_utc(end_raw), tz)
@@ -395,6 +401,14 @@ def _load_samples(conn, data: ExportData, tz: tzinfo, aliases: dict[str, str],
                 summary.strength_sets += 1
             else:
                 summary.unmapped_types[f'{type_code} without its details'] += 1
+            continue
+        if type_code == STEP_BUCKET_TYPE:
+            # Checked before the HealthKit identifier: these carry StepCount's,
+            # and read as records they would be counted into the day's steps.
+            if add_step_bucket(data, parse_utc(start_raw).astimezone(tz), float(value)):
+                summary.step_buckets += 1
+            else:
+                summary.unmapped_types[f'{type_code} value {value}'] += 1
             continue
         hk = meta.get('healthkit_identifier') or aliases.get(type_code)
         if not hk:

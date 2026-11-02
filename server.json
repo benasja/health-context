@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.benasja/health-context",
+  "title": "Apple Health (health-context)",
+  "description": "Ask about your Apple Health data, compared with your own baselines. Runs on your computer.",
+  "version": "2.6.0",
+  "repository": {
+    "url": "https://github.com/benasja/health-context",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/benasja/health-context",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/benasja/health-context/releases/download/v2.6.0/health-context.mcpb",
+      "version": "2.6.0",
+      "fileSha256": "4cdb95e455d2d2be9bb88f1f5976ae21cdfaf5b443fab5f17bd10174982b0a1c",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

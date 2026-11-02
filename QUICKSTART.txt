@@ -1,6 +1,10 @@
 health-context — Quick start
 ============================
 
+THE EASY WAY: no Terminal at all. Install health-context.mcpb in Claude Desktop
+and AirDrop your export to Downloads. See "Get started" in README.md. What
+follows is the manual route, for running the converter yourself.
+
 ON YOUR COMPUTER (Mac or Windows)
 ---------------------------------
 
@@ -61,7 +65,7 @@ Serving it to an AI assistant (MCP)
 
 Runs the same data as a local MCP server, so an assistant can query your
 baselines and percentiles directly instead of you pasting a summary. --check
-verifies the setup and exits. See the README for client configuration.
+verifies the setup and exits. See docs/mcp.md for client configuration.
 
 Useful options
 --------------

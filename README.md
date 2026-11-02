@@ -1,346 +1,154 @@
 # health-context
 
-**Your Apple Health data, with enough context to judge it.**
+**Ask Claude about your Apple Health data, and get answers that know what is normal for *you*.**
 
-Ask an LLM about your own health and it can only tell you what the last month
-looked like. This computes the part that makes a number mean something — that
-10 minutes a day is 15% of what *you* personally sustained for 28 days in
-January — then hands it over as a briefing, or serves it live over MCP so an
-assistant can query it directly.
+[![CI](https://github.com/benasja/health-context/actions/workflows/ci.yml/badge.svg)](https://github.com/benasja/health-context/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/benasja/health-context)](https://github.com/benasja/health-context/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Runs entirely on your machine. Nothing is uploaded, no account, no API key.
-Point it at a local model and your health data never leaves the laptop at all.
+<p align="center">
+  <img src="docs/demo-chat.svg" width="820" alt="An example chat. The person asks whether the week of 18 November, their best week of sleep, was a good week. Claude answers that it was also the largest strain episode in their record, with five vital signs off together for seven days, which usually means the body was fighting something off.">
+</p>
 
-Python 3.10+. **No dependencies** — standard library only.
+Your iPhone and Apple Watch have been recording your sleep, heart rate, HRV,
+workouts and steps for years. health-context lets Claude read all of it and
+compare today with your own history, not with population averages. "Your HRV is
+50 ms" doesn't tell you anything. "Your HRV is in the top fifth of your own
+record" does.
 
-## See it before you export anything
+- **Runs on your computer.** Your export is read on your computer and never
+  uploaded. Claude only sees the short answers to the questions it asks.
+- **No account, no subscription, no Terminal.** Install it in Claude Desktop
+  in a few clicks.
+- **Free and open source** (MIT).
 
-You do not need your own data to judge whether this is worth your time. There is
-a generator for a synthetic two-and-a-half-year export — seasons, a training
-block, two illnesses, a holiday where the watch stayed at home:
+## Get started
+
+You need a Mac or Windows PC with [Claude Desktop](https://claude.ai/download),
+and an iPhone.
+
+**1. Install the extension.** Download
+[**health-context.mcpb**](https://github.com/benasja/health-context/releases/latest/download/health-context.mcpb)
+and double-click it. Claude Desktop opens and asks to install it. Click
+**Install**. When it asks where your export will be, leave it on **Downloads**.
+
+**2. Export your health data.** On your iPhone, open the **Health** app, tap your
+profile picture (top right), then **Export All Health Data**. It takes a few
+minutes, then shows a share sheet:
+
+- **Mac:** AirDrop it to your Mac. It lands in Downloads.
+- **Windows:** save it to iCloud Drive or email it to yourself, then put the zip
+  in your Downloads folder.
+
+Leave it zipped.
+
+**3. Ask Claude.** Start a new chat and ask anything:
+
+> How did I sleep last month compared with my best month?
+>
+> Am I fitter than a year ago?
+>
+> What were my ten biggest training days ever?
+>
+> Was I ill in November? What do my vitals say?
+>
+> Which of my habits actually move my HRV?
+
+The first time takes a minute or two while it reads the export. Claude will say
+so if you ask too early. On a Mac, Claude Desktop may ask to access your
+Downloads folder: allow it.
+
+**Keeping it up to date:** export again whenever you like (once a month is
+plenty) and send it to Downloads the same way. The newest export is picked up
+by itself, with no restart.
+
+## Tell it what the data can't know
+
+Your watch records what your body did, never why. If your training dropped
+because of surgery, an assistant that doesn't know will tell you to get your
+motivation back. So tell Claude once:
+
+> Remember that I had wrist surgery in November 2025, and that I'm training
+> for a half marathon in April.
+
+It saves this to a short profile on your computer (`health_profile_update`) and
+reads it first in every later chat. You can ask it to show or change the profile
+at any time.
+
+## Why the answers are better than pasting numbers into a chat
+
+Ask an assistant about raw health numbers and it can only describe the last few
+weeks. health-context first works out your personal baselines, percentiles and
+best periods across your whole history, plus which days you weren't wearing the
+watch and which records were counted twice. Then it hands Claude the finished
+comparison.
+
+The picture at the top is a real example from the synthetic demo data. In the
+week of 18 November 2024, the demo person had the best week of sleep in two and a
+half years. Hand an assistant the raw rows and it will congratulate them. But
+five vital signs moved the wrong way together that week (wrist temperature,
+resting heart rate, HRV, breathing rate and blood oxygen), which is what illness
+looks like. Only something that knows that person's normal can tell resting
+apart from recovering.
+
+Nothing about that week is hardcoded. The strain detector found it on its own,
+and every baseline was inferred from the export. More on the method:
+[docs/how-it-works.md](docs/how-it-works.md).
+
+## Privacy
+
+- The export is read on your computer. This project makes no network calls and
+  sends your data nowhere. (When you install the extension, Claude Desktop
+  downloads a private copy of Python once, to run it.)
+- Claude gets only what a question needs, such as a table of weekly sleep
+  averages, through the chat you are already having. Your chats are handled the
+  way Anthropic handles any Claude conversation.
+- Want nothing to leave your computer at all? It also works with local models:
+  see [docs/mcp.md](docs/mcp.md#other-clients-and-local-models).
+- What it builds is kept in `~/Library/Application Support/health-context` on a
+  Mac (`%APPDATA%\health-context` on Windows). That is outside Documents and
+  Desktop, which may be syncing to iCloud. Delete the folder to remove
+  everything.
+- No health data is ever committed to this repository, and CI fails if any is.
+
+## Not medical advice
+
+Every baseline here is yours, not a population norm, and every flag is a prompt
+to pay attention, not a diagnosis. If something concerns you, talk to a
+clinician.
+
+---
+
+## For technical users
+
+Everything above is the same Python code you can run yourself. Python 3.10+,
+**standard library only**, on macOS, Linux and Windows.
+
+| You want to | Read |
+|---|---|
+| Convert an export into CSVs and a written report, or try the synthetic demo | [docs/command-line.md](docs/command-line.md) |
+| Use it from Claude Code, Cursor, another MCP client, or a local model | [docs/mcp.md](docs/mcp.md) |
+| Keep it current automatically from your phone, through a home server | [docs/health-bridge.md](docs/health-bridge.md) |
+| Know what it computes and why (baselines, wear detection, de-duplication, sleep, scores) | [docs/how-it-works.md](docs/how-it-works.md) |
+
+The quickest look, with no export of your own:
 
 ```bash
+git clone https://github.com/benasja/health-context && cd health-context
 python3 fixtures/make_demo_export.py --out-dir demo
 python3 convert_health_data.py --data-dir demo --out-dir demo
+python3 health_mcp.py --data-dir demo --check
 ```
 
-Four seconds later, `demo/llm_context.md` opens like this:
-
-```
-| metric                          | current | n     | pctile | best 28d | when                   |
-|---------------------------------|---------|-------|--------|----------|------------------------|
-| Steps (steps/day)               | 10,106  | 28/28 | 64%    | 12,702   | 2025-05-18..2025-06-14 |
-| Active energy (kcal/day)        | 498     | 28/28 | 31%    | 1,021    | 2025-05-21..2025-06-17 |
-| Sleep (h/night)                 | 7.26    | 28/28 | 19%    | 7.75     | 2024-11-10..2024-12-07 |
-| HRV (SDNN) (ms)                 | 50.2    | 28/28 | 79%    | 54.5     | 2025-05-23..2025-06-19 |
-| Resting HR (bpm) (lower better) | 52.4    | 28/28 | 93%    | 50.6     | 2025-05-19..2025-06-15 |
-| VO2 max (ml/kg/min)             | 44.7    | 6/28  | 52%    | 48.3     | 2025-05-10..2025-06-06 |
-```
-
-`50.2 ms` of HRV is not something anyone can act on. `50.2 ms, the 79th
-percentile of your own 934 rolling 28-day windows, against a personal best of
-54.5 in June 2025` is. That difference is the whole project.
-
-### Why that context is not a nicety
-
-The same run reports this, unprompted:
-
-```
-- 2024-11-18 — Largest physiological strain episode of the record: 7 flagged days in 7
-  - 4.1x the mean flagged-day count of the other 17 episodes
-  - signals: wrist temp, resting HR, HRV, respiratory rate, SpO2
-```
-
-Now look at where that same week ranks on sleep:
-
-```
-| Sleep (h/night) | best 7 days | 8.58 | 2024-11-18..2024-11-24 |
-```
-
-The best week of sleep in two and a half years is the week the subject had
-influenza. Hand an assistant raw rows and it will congratulate them on it. Five
-vital signs moved together that week, and only something computing against a
-personal baseline can tell the difference between resting and recovering.
-
-Nothing is hardcoded to the fixture. The strain detector found that week on its
-own, and the analysis window, the max heart rate and every baseline were inferred
-from the export.
-
-The demo data is fabricated — shaped to be plausible, not to be anyone's real
-physiology, and no number in it is a reference range. No health data is committed
-to this repository: the export is generated on demand, and CI fails if one ever
-lands in git history.
-
-## Quick start
-
-1. Health app → profile picture → **Export All Health Data**. AirDrop or copy
-   the zip to your computer.
-2. Point the tool at it. **No unzipping** — hand it the zip exactly as it arrived:
-
-```bash
-python3 convert_health_data.py --data-dir ~/Downloads/export.zip --out-dir output
-```
-
-`--data-dir` accepts the `.zip`, an unzipped `apple_health_export/` folder, or
-any folder containing either — point it at `~/Downloads` and it picks the newest
-export it finds. Only the files actually parsed are extracted (~1 GB of the
-~1.4 GB export is route GPX and a clinical-document mirror that is never read),
-and the extraction is cached until you export again.
-
-A full run is around two minutes, with a progress bar during the parse.
-
-### Installing
-
-Nothing to install — clone and run, on macOS, Linux or Windows. Python 3.10+,
-zero dependencies.
-
-If you would rather have the commands on your `PATH`:
-
-```bash
-pip install git+https://github.com/benasja/health-context
-health-convert --data-dir ~/Downloads/export.zip --out-dir ~/health
-```
-
-That gives you `health-convert` and `health-mcp`. Still no runtime dependencies —
-packaging only adds the entry points.
-
-### Options
-
-| Flag | Purpose |
-|------|---------|
-| `--data-dir DIR` | Where `export.xml` lives (default: next to the script) |
-| `--out-dir DIR` | Where to write outputs (default: same as `--data-dir`) |
-| `--max-hr BPM` | Max heart rate for zone maths. Default: highest *corroborated* value in the export |
-| `--age N` | Sanity-checks max HR against `208 - 0.7 x age` |
-| `--skip-legacy` | Skip the large flat `full_health_data.csv` (much faster) |
-| `--include-cda` | Also parse `export_cda.xml` — **see the warning below** |
-
-## Outputs
-
-| File | What it is |
-|------|-----------|
-| `insights_report.md` | **Start here.** Recovery, strain flags, sleep regularity, training load, trends, associations |
-| `llm_context.md` | Compact pre-analysed brief to paste into an LLM |
-| `daily_metrics.csv` | One row per day, 60+ columns of raw daily aggregates |
-| `daily_insights.csv` | Per-day baselines, deviations, z-scores, scores and flags |
-| `weekly_summary.csv` | One row per ISO week |
-| `workout_summary.csv` | One row per workout: HR and minutes in each zone, cycling power and cadence, which device recorded them, and a flag on records that look wrong |
-| `workout_series.csv` | Minute by minute HR, power and cadence for each workout |
-| `hr_timeline.csv` | Every heart-rate reading in 5-minute buckets (avg, min, max) with the steps taken in each, labelled with the sleep stage or workout it fell in, or else walking, light activity or stationary from its steps. Steps come from a receiver, when Wariden sends them per 5 minutes; otherwise they are empty and so is the label |
-| `strength_sets.csv` | From a receiver, when Wariden sends its log: one row per set — exercise, set type, weight, reps, RPE, volume, estimated 1RM, notes |
-| `strength_sessions.csv` | One row per Wariden strength workout: program, sets, reps, volume, each exercise as weight x reps, and the matching Apple Health workout's energy and heart rate |
-| `data_status.json` | When the data was built, its newest record and, from a receiver, when the phone last synced |
-| `metric_coverage.csv` | Per metric: first date, **reliable start**, coverage % |
-| `data_quality_report.txt` | Wear stats, coverage, multi-device warnings, duplicate bursts |
-| `available_types.csv` | Every Health type in the export with counts |
-| `full_health_data.csv` | Legacy flat export (all records, one row each) |
-
-Units are normalised to **kg, km, kcal, bpm, minutes, %**. Empty cells mean
-*not measured* — never zero.
-
-## The parts that matter
-
-### It finds your own start date
-
-A new watch backfills nothing, so metrics begin when the hardware does. But an
-app installed once and abandoned leaves a scatter of samples across earlier
-years. For each metric the tool finds the **reliable start**: the first date
-where at least half of the following 28 days carry a value. The analysis window
-then opens where the continuously-tracked core metrics (resting HR, HRV, staged
-sleep) are *all* live. Nothing is hardcoded.
-
-### It knows when you weren't wearing the watch
-
-`wear_hours` counts distinct clock hours with a sample that requires skin
-contact — heart rate, physical effort, stand time. Days are classed `full`
-(>=18h), `partial` (>=8h), `minimal` or `none`, so non-wear days stop silently
-dragging down averages.
-
-Deliberately excluded from this signal: basal and active energy. Basal energy is
-a model (BMR x elapsed time) the watch emits around the clock whether or not it
-is on your wrist, so counting it marks every day as fully worn and defeats the
-entire point.
-
-### It de-duplicates across devices
-
-An iPhone in a pocket and a watch on a wrist count the same steps. Summing the
-export's raw records inflates step totals by roughly a third. The tool takes
-sources best-first (watch, then phone, then anything else) and counts each
-stretch of time only once — so the phone still fills in hours the watch was off,
-without double-counting the hours it wasn't.
-
-Applied to steps, walking distance, flights climbed and active energy. Dietary
-metrics get the same treatment via a per-day primary source, since two food
-apps mirroring the same meals would otherwise double every total.
-
-### It picks one sleep source per night
-
-Nights are often logged by the watch, the phone and a third-party tracker at
-once. Rather than summing overlapping segments, one authoritative source wins
-per night: staged data (REM/Core/Deep) beats unstaged, and among equals the one
-with the most recorded sleep wins.
-
-### It refuses to report trends it cannot support
-
-Weight, body fat and VO2 max are measured occasionally. Carrying the last
-reading forward is right for estimating *today's* value, but averaging those
-carried rows turns two measurements into a confident-looking multi-week trend.
-Trends for these are withheld unless there are at least 3 genuine measurements
-in each period, and the report says which were withheld and why.
-
-The quality report also flags metrics recorded by more than one device, because
-two bioimpedance scales disagreeing by several percentage points is not fat loss.
-
-### Max heart rate is inferred, not assumed
-
-Zones are only as good as the ceiling they are measured against. The tool uses
-the highest heart rate anywhere in the export — including `WorkoutStatistics`
-maxima, which often hold peaks the periodic sample stream misses — but discards
-an isolated peak standing more than 10 bpm above every other observation, since
-wrist optical sensors throw artifacts during strength work. Override with
-`--max-hr` if you know your true max.
-
-## What gets computed
-
-**Recovery score (0-100)** — weighted blend of HRV (30%), resting HR (25%),
-sleep duration (25%), sleep efficiency (10%) and respiratory rate (10%), each
-scored against your own 60-day rolling baseline, where 70 means "at baseline".
-The component list is emitted alongside so the number is auditable.
-
-**Strain flags** — days where two or more of {wrist temperature up, resting HR
-up, HRV down, respiratory rate up, SpO2 down} moved together against your
-baseline. Any one of these moves for boring reasons; the combination is the
-pattern consumer wearables use for illness onset.
-
-**Sleep regularity** — standard deviation of sleep midpoint over 14 days,
-computed with circular statistics so times either side of midnight compare
-correctly.
-
-**Training load** — acute (7-day) to chronic (28-day) exercise-minute ratio.
-The 0.8–1.5 band is the commonly cited sweet spot. Below a 28-day mean of
-21 min/day (~150 min/week, the WHO activity guideline) the ratio is reported
-but deliberately **not** classified: at 10 min/day a single 45-minute session
-moves it across a whole category, so the label would describe one workout
-rather than a training pattern. The ratio is a contested heuristic from
-team-sport research and assumes near-daily training.
-
-**Cycling power** — where a trainer or power meter recorded watts, the
-duration-weighted average is reported against your FTP. Power is *measured*
-rather than inferred, so unlike heart rate it does not drift with heat,
-caffeine, sleep or stress — it is the most reliable intensity figure an Apple
-Health export contains. Roughly: under 55% of FTP is recovery riding, 56–75%
-endurance, 76–90% tempo, above 90% threshold.
-
-**Associations** — lagged correlations between what you do and what your body
-does next (sleep → next-day HRV, steps → next-night deep sleep, and so on).
-Reported with `n` and a significance marker; relationships with fewer than 30
-paired days are omitted rather than reported weakly.
-
-**Capacity gap** — your current 28-day mean against the best 28-day mean you
-have ever held, with the date you held it. A rolling baseline drifts with you,
-so on its own it will describe a two-year decline as "slightly worse than
-lately"; this is the number that says 10 min/day is 15% of what you have
-already proven you can sustain.
-
-**Personal records, eras, streaks** — best day, best rolling 7 and 28 days,
-best ISO week and best calendar month for each key metric, all dated; the
-timeline cut into contiguous load regimes with the sleep, HRV, resting HR and
-weight that accompanied each; and longest/current streaks against plain
-thresholds. Percentile tables make every other number in the pack readable, and
-scattered strain days are grouped into episodes with start, end and duration.
-
-## Metrics captured
-
-Around 45 HealthKit types across activity, cardiovascular, respiratory, sleep,
-body composition, mobility/gait, nutrition, environment and mindfulness —
-including physical effort (METs), SpO2, sleeping wrist temperature, breathing
-disturbances, heart-rate recovery, time in daylight, walking speed/asymmetry/
-double-support/steadiness, stair speeds and AFib burden.
-
-Run once and read `metric_coverage.csv` for exactly what your own export
-contains. Adding another metric is a single `MetricSpec` entry in
-`health_metrics.py`.
-
-> **Percent units:** HealthKit stores `%` as a fraction (`0.183` = 18.3%). Every
-> percent-valued metric is scaled to real percentages on the way out. Body fat
-> read straight from the XML looks like 0.18%.
-
-## `--include-cda` warning
-
-`export_cda.xml` is an HL7 clinical-document mirror of `export.xml`. Its records
-carry different date formats and source names, so they cannot be matched against
-the main export for de-duplication — including it **double-counts** every summed
-metric. Off by default; only enable it if `export.xml` is missing.
-
-## Sample data
-
-```bash
-mkdir -p /tmp/fx && cp fixtures/sample_export.xml /tmp/fx/export.xml
-python3 convert_health_data.py --data-dir /tmp/fx
-```
-
-## Layout
-
-| Module | Role |
-|--------|------|
-| `health_metrics.py` | Declarative metric registry — units, aggregation, grouping |
-| `health_coaching.py` | Parsing, daily/weekly/workout aggregation, de-duplication, coverage |
-| `health_insights.py` | Baselines, z-scores, scores, flags, trends, associations, reports |
-| `health_history.py` | Long memory — records, capacity gap, eras, streaks, strain episodes, distributions |
-| `convert_health_data.py` | CLI entry point, CDA and ECG handling |
-| `health_bridge_import.py` | Reads a Health Bridge receiver's database in place of an export |
-| `health_hr_timeline.py` | Heart rate and steps through the day in 5-minute buckets, with sleep, workout and step context |
-| `health_recs.py` | The suggestions log: kept as events, judged against the weeks before |
-| `health_strength.py` | Sets logged in Wariden, from the receiver, into the strength CSVs |
-| `health_sync.py` | Unattended rebuild loop for a receiver, with atomic snapshots |
-| `health_mcp.py` | MCP server over the generated files |
-
-## Ask questions instead of reading files (MCP server)
-
-Rather than pasting `llm_context.md` into a chat, let the assistant query your
-data directly. `health_mcp.py` is an [MCP](https://modelcontextprotocol.io)
-server exposing 21 tools over stdio — still zero dependencies, still entirely
-local, nothing uploaded anywhere.
-
-```
-"How did I sleep last week compared with my best month?"
-"What were my ten biggest training days ever?"
-"Was I ill in November? What do the vitals say?"
-"Compare my exercise this month against January 2025."
-```
-
-### Setup
-
-**1.** Generate the data once (repeat whenever you re-export):
-
-```bash
-python3 convert_health_data.py --data-dir apple_health_export --out-dir output
-```
-
-**2.** Check it loads:
-
-```bash
-python3 health_mcp.py --data-dir output --check
-```
-
-**3.** Register it. For **Claude Code**:
-
-```bash
-claude mcp add apple-health -- python3 "$PWD/health_mcp.py" --data-dir "$PWD/output"
-```
-
-For **Claude Desktop** or any other MCP client, print the config block and paste
-it into the client's `mcpServers` object:
-
-```bash
-python3 health_mcp.py --data-dir output --print-config
-```
-
-Claude Desktop keeps that file at
-`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS.
-Restart the client afterwards.
-
-### Tools
+### What Claude can look up
+
+`health_mcp.py` is an [MCP](https://modelcontextprotocol.io) server
+exposing 22 tools over stdio. The extension runs it with `--export ~/Downloads`,
+which builds the data in the background and picks up newer exports
+([health_watch.py](health_watch.py)).
+
+<details>
+<summary>All 22 tools</summary>
 
 | Tool | Answers |
 |------|---------|
@@ -361,216 +169,59 @@ Restart the client afterwards.
 | `health_weekly` | Week-by-week rollup |
 | `health_context_pack` | The whole briefing |
 | `health_profile` | Your goals and constraints, if you wrote any down |
+| `health_profile_update` | Save what you told it about yourself, for every later chat |
 | `health_data_quality` | Wear rates, coverage, excluded artifacts |
 | `health_recommend` | Record a suggestion, the evidence for it and the metrics that should move |
 | `health_recommendations` | Earlier suggestions, whether they were followed, and what the data did since |
 | `health_recommendation_update` | Whether a suggestion is being followed, with a note |
 
-The last three are the only ones that write anything. A chat's advice usually
-ends with the chat: "lights out by 23:30" is given, maybe followed, and never
-checked. `health_recommend` keeps it with its evidence and the metrics that
-should move (resting HR down, deep sleep up), and `health_recommendations`
-later compares the days since it started with the four weeks before, calling a
-change better or worse only when it is larger than the day-to-day noise. It
-can't tell what caused the change, and says so. The log is an append-only
-`recommendations.jsonl` beside the snapshots (or in the data folder), outside
-anything a rebuild replaces; `--state-dir` puts it elsewhere.
+</details>
 
-Every answer starts with one line saying how fresh the data is (when the phone
-last synced, the newest record, when it was rebuilt) and, if today is
-involved, that today's totals are still partial. Workouts are shown with the
-same columns wherever they appear: start and end, HR, minutes in each zone,
-power, cadence, the device that recorded them, and a flag on records that look
-wrong (hours long with no heart rate, a speed no one rides at).
+Four of them write anything: `health_profile_update`, and the three suggestion
+tools. A chat's advice usually ends with the chat: "lights out by 23:30" is
+given, maybe followed, and never checked. `health_recommend` keeps it with its
+evidence and the metrics that should move, and `health_recommendations` later
+compares the days since with the four weeks before. It calls a change better or
+worse only when it is larger than the day-to-day noise, and it says that it
+can't tell what caused it.
 
-### What one of them actually returns
+Every answer starts with a line saying how fresh the data is, and whether
+today's totals are still partial.
 
-The tools that make this different from a metrics viewer are the ones that
-decide what is worth your attention. `health_strain_episodes`, run against the
-synthetic demo export above:
-
-```
-## Physiological strain episodes (most severe first)
-
-18 episode(s) across the record; flagged days within 2 clear days of each other
-are one episode. A flagged day is one where two or more of wrist temperature,
-resting HR, HRV, respiratory rate and SpO2 moved the wrong way against the
-personal 60-day baseline together. Sorted by flagged days rather than by date,
-because one of these is usually far more consequential than the rest and date
-order hides it.
-
-| episode                | span days | flagged days | peak signals | signals                                             |
-|------------------------|-----------|--------------|--------------|-----------------------------------------------------|
-| 2024-11-18..2024-11-24 | 7         | 7            | 5            | wrist temp, resting HR, HRV, respiratory rate, SpO2 |
-| 2026-02-10..2026-02-15 | 6         | 6            | 3            | wrist temp, HRV, respiratory rate, resting HR, SpO2 |
-| 2025-11-12..2025-11-16 | 5         | 3            | 2            | HRV, SpO2, resting HR                               |
-```
-
-Nothing there is a diagnosis, and the tool does not offer one — it says which
-days are unusual *for you* and which signals agreed, and leaves the conclusion
-to you. The threshold is your own 60-day baseline, so it means something
-different for every person who runs it.
-
-The server reads the generated CSVs, never `export.xml` — parsing a gigabyte of
-XML takes ~40 seconds, which no client will wait for on every call. It reports
-how old the data is, so the model knows when it is answering from a stale export.
-
-### Other clients, and local models
-
-MCP is an open protocol, so this is not Claude-specific — anything that speaks
-MCP over stdio works. That includes editor assistants (Cursor, Zed, Continue,
-Cline, VS Code) and clients that can drive a **local** model, which is the
-interesting case for health data: nothing ever leaves the machine, not even to
-an API.
-
-The reason a modest local model can do useful work here is that it never has to
-crunch anything. The 2.1M records, the baselines, the percentiles and the
-capacity comparisons are all computed in Python beforehand; the model reads a
-small table and reasons about it. That is a very different task from handing a
-7B model a year of CSV and hoping.
-
-Two things matter when running locally:
-
-**Context window.** A single uncapped tool result can swallow an 8K window
-before the model answers anything. Cap it:
+### Building the extension
 
 ```bash
-python3 health_mcp.py --data-dir output --max-output-chars 6000
+python3 extension/build.py      # -> dist/health-context.mcpb
 ```
 
-`health_context_pack` also takes a `section` argument — called bare it returns a
-~300-token index of the 15 sections, so the model fetches only what it needs
-instead of a 6,500-token wall. Any result that does get cut says so explicitly,
-including a warning not to treat the last visible row as the last that exists.
+It reads the version from `pyproject.toml` and the tool list from the server, so
+the manifest can't drift. Releases attach the built file.
 
-**Tool-calling quality.** The server assumes a model that reads tool
-descriptions and picks sensibly. Very small models tend to guess metric names
-instead of calling `health_list_metrics` first, then report "no data" for a
-metric that exists under another name. Anything competent at function calling
-handles this; the smallest models will need the metric name given to them.
-
-## Tell it what the data cannot know
-
-The export records what your body did. It has no idea *why*. Without that,
-anything reading it fills the gap with a guess — and the usual guess is that a
-drop in training means you lost motivation, when it might have been surgery.
-
-Copy the template and write three honest lines:
+### Development
 
 ```bash
-cp profile.example.md profile.md
-```
-
-```markdown
-## Constraints
-- TFCC surgery Nov 2025. No loaded wrist extension yet.
-
-## Context for the data
-- The training drop from Oct 2025 is medical, not motivational.
-- I am NOT trying to return to January 2025 volume.
-```
-
-It is picked up automatically, placed at the very top of the context pack ahead
-of every number, and exposed as the `health_profile` MCP tool. The pack tells the
-reader to believe it over anything inferred from the data. With no profile, it
-says so explicitly and instructs the reader not to guess.
-
-`profile.md` is gitignored. Only the template ships.
-
-## Keeping it up to date automatically
-
-**Apple provides no way to trigger an export programmatically** — no API, no
-Shortcuts action, no iCloud sync of the export file. "Export All Health Data" is
-a manual tap. There are two ways around that.
-
-### Fully automatic: Health Bridge on a home server
-
-[Health Bridge for AI](https://github.com/roian6/apple-health-ai-bridge) is an
-iPhone app that syncs Apple Health in the background to a receiver on a Mac or
-Linux machine you own. health-context reads the receiver's database directly —
-read-only, never touching its pairing or credential tables — and gives the same
-results as an export of the same data; CI checks that on every change. Tested
-with receiver v1.1.2.
-
-`health_sync.py` keeps the pack current from it, rebuilding whenever the phone
-has synced. A rebuild never replaces the data an open session is reading, and a
-failed one leaves the last good pack in place:
-
-```bash
-python3 health_sync.py --bridge-db ~/.local/share/health-bridge/health.sqlite \
-    --out-root ~/health-context-data
-python3 health_mcp.py --data-dir ~/health-context-data/current --check
-```
-
-There is a Docker Compose file for running it next to the receiver on a home
-server, and the MCP server can be reached from a laptop over SSH. Setup,
-troubleshooting and the few things the app does not sync:
-[docs/health-bridge.md](docs/health-bridge.md).
-
-### Semi-automatic: from the newest export
-
-Everything *after* the export can be automated, and the manual part reduces to:
-export, AirDrop to your Downloads folder, done.
-
-Point the scheduler at the folder your exports land in:
-
-```bash
-python3 convert_health_data.py --data-dir ~/Downloads --out-dir ~/health --print-schedule
-```
-
-That prints a ready-to-install monthly job for your OS — a launchd plist on
-macOS, a systemd service and timer on Linux, a `schtasks` command on Windows —
-with real paths already filled in. Save or run it as the comment says.
-
-From then on it rebuilds monthly from the newest export in that folder. The MCP
-server notices rebuilt files on its next call, so it needs no restart, and if you
-forget to export it tells the model the data is stale rather than quietly
-answering from old numbers.
-
-## Development
-
-```bash
-python3 test_health.py                  # 303 tests, stdlib only
+python3 test_health.py                  # stdlib only
 pip install ruff && ruff check .
 ```
 
 Every test corresponds to a bug that actually shipped and produced a plausible
-*wrong number* rather than an error — percent metrics reported as fractions,
+*wrong number* rather than an error: percent metrics reported as fractions,
 sleep nights split across calendar days, an isolated sensor artifact setting max
-HR for a whole history, basal energy marking unworn days as worn. That is the
-failure mode worth defending against: a pipeline that crashes tells you it is
-broken, one that emits confident nonsense does not.
+HR for a whole history, basal energy marking unworn days as worn. A pipeline
+that crashes tells you it is broken. One that emits confident nonsense does not.
 
-CI runs the tests on Python 3.10–3.13 (plus macOS), lints, executes the fixture
-end-to-end, asserts every output file is non-empty, and **fails the build if any
-health-data file is ever tracked by git**.
+CI runs the tests on Python 3.10–3.13, macOS and Windows, executes the fixtures
+end to end, and fails the build if any health-data file is ever tracked by git.
 
-## Privacy
+### Limitations
 
-Your export stays on your machine; the tool makes no network calls. `.gitignore`
-excludes `export.xml`, `export_cda.xml`, `apple_health_export/`,
-`electrocardiograms/`, `workout-routes/`, `*.zip`, `*.sqlite` and all generated CSVs —
-health data should never enter git history, where every version lives forever.
-CI enforces this, so a fork cannot quietly regress it.
-
-## Limitations
-
-**Validated against one person's export.** Every fix so far was driven by a
-single ~2M-record dataset from an Apple Watch + iPhone + Wahoo trainer. Other
-devices, apps and locales will exercise paths that have never run. Bug reports
-describing the shape of your data are genuinely useful.
+**Validated against one person's export.** Every fix so far came from a single
+~2M-record dataset from an Apple Watch, an iPhone and a Wahoo trainer. Other
+devices, apps and locales will exercise paths that have never run.
+[Bug reports](https://github.com/benasja/health-context/issues) describing the
+shape of your data are genuinely useful.
 
 **Scores are judgement, not instruments.** The recovery weights, the load-band
-thresholds, the 90-minute sleep-session gap, the 21 min/day load floor — all
-documented at their definitions, none derived from research on you. Component
-breakdowns are always emitted so a number can be audited rather than trusted.
-
-**Eras are bucketing, not change-point detection.** The timeline is split by a
-smoothed load signal crossing fixed thresholds. Boundaries can therefore land
-close to an edge, and the output prints how close.
-
-## Not medical advice
-
-Every baseline here is personal, not a population norm, and every flag is a
-prompt to pay attention rather than a diagnosis. Anything that concerns you is a
-reason to talk to a clinician.
+thresholds and the sleep-session gap are all documented where they are defined,
+and none was derived from research on you. Component breakdowns are always shown,
+so a number can be checked rather than trusted.

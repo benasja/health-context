@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 470" width="820" height="470" role="img" aria-label="An example chat. The person asks whether the week of 18 November, their best week of sleep, was a good week. Claude answers that it was also the largest strain episode in their record, with five vital signs off together for seven days, which usually means the body was fighting something off.">
+  <style>
+    .bg { fill: #f7f5f2; }
+    .frame { fill: none; stroke: #e4e0da; }
+    .label { fill: #8a857d; font: 500 13px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .you { fill: #e9e4dc; }
+    .you-text { fill: #2b2926; font: 16px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .chip { fill: #ffffff; stroke: #e4e0da; }
+    .chip-text { fill: #6f6a62; font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .text { fill: #2b2926; font: 16px system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .strong { font-weight: 650; }
+    .dot { fill: #e2264d; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #1f1e1c; }
+      .frame { stroke: #34322e; }
+      .label { fill: #9a958c; }
+      .you { fill: #34322e; }
+      .you-text, .text { fill: #ece9e4; }
+      .chip { fill: #282725; stroke: #3d3a35; }
+      .chip-text { fill: #b3aea5; }
+    }
+  </style>
+  <rect class="bg" x="0.5" y="0.5" width="819" height="469" rx="16"/>
+  <rect class="frame" x="0.5" y="0.5" width="819" height="469" rx="16"/>
+  <text class="label" x="32" y="38">Claude Desktop with health-context · synthetic demo data</text>
+
+  <rect class="you" x="262" y="62" width="526" height="70" rx="18"/>
+  <text class="you-text" x="286" y="92">I slept amazingly the week of 18 November.</text>
+  <text class="you-text" x="286" y="116">Was that a good week for me?</text>
+
+  <circle class="dot" cx="44" cy="168" r="6"/>
+  <rect class="chip" x="60" y="154" width="304" height="28" rx="8"/>
+  <text class="chip-text" x="72" y="173">health_sleep · health_strain_episodes</text>
+
+  <text class="text" x="32" y="222">It was your <tspan class="strong">best week of sleep in two and a half years</tspan>: 8.6 hours</text>
+  <text class="text" x="32" y="246">a night. But it was also the <tspan class="strong">biggest strain episode in your whole record</tspan>.</text>
+
+  <text class="text" x="32" y="286">For 7 days in a row, five signals moved the wrong way together against</text>
+  <text class="text" x="32" y="310">your own baseline: wrist temperature, resting heart rate and breathing rate</text>
+  <text class="text" x="32" y="334">up, HRV and blood oxygen down.</text>
+
+  <text class="text" x="32" y="374">That pattern usually means your body was fighting something off, so the</text>
+  <text class="text" x="32" y="398">extra sleep looks like recovery rather than a habit worth copying.</text>
+  <text class="text" x="32" y="438">Do you remember being ill around then?</text>
+</svg>

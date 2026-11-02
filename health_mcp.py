@@ -28,6 +28,8 @@ from datetime import date, datetime
 from typing import Any
 from collections.abc import Callable
 
+from health_ingest import PROFILE_NAME, load_profile
+from health_watch import ExportWatcher
 from health_recs import (
     DEFAULT_BASELINE_DAYS,
     DEFAULT_REVIEW_DAYS,
@@ -38,7 +40,7 @@ from health_recs import (
 )
 
 SERVER_NAME = 'apple-health'
-SERVER_VERSION = '2.5.0'
+SERVER_VERSION = '2.6.0'
 
 # Protocol revisions this server is known to work against. If a client asks for
 # something else it still gets a usable session — the tool surface has not
@@ -121,7 +123,13 @@ class HealthData:
         self.dir = os.path.realpath(self.root)
         # The one thing written: suggestions and what came of them, kept apart
         # from the outputs because those are replaced on every rebuild.
-        self.recs = RecommendationLog(state_dir or state_dir_for(data_dir))
+        self.state_dir = os.path.abspath(state_dir or state_dir_for(data_dir))
+        self.recs = RecommendationLog(self.state_dir)
+        # Where the converter looks for it too, so what is saved here reaches
+        # the briefing at the next rebuild.
+        self.profile_path = os.path.join(self.state_dir, PROFILE_NAME)
+        # Set when the server builds its own data from an export folder (--export).
+        self.watcher: ExportWatcher | None = None
         self._cache: dict[str, Any] = {}
         self._stamp = self._file_stamp()
 
@@ -171,6 +179,8 @@ class HealthData:
         return bool(self.table('daily'))
 
     def missing_data_message(self) -> str:
+        if self.watcher:
+            return self.watcher.waiting_message()
         parent = os.path.dirname(self.root)
         if os.path.isdir(os.path.join(parent, 'snapshots')) or os.path.exists(
                 os.path.join(parent, '.lock')):
@@ -1366,14 +1376,58 @@ def _context_pack(data: HealthData, args: dict[str, Any]) -> str:
     obj({}),
 )
 def _profile(data: HealthData, _args: dict[str, Any]) -> str:
+    # The file first: it may have been saved since the last rebuild.
+    saved = load_profile(data.profile_path)
+    if saved:
+        return saved
     doc = data.doc('context')
     sections = markdown_sections(doc) if doc else {}
     for name, body in sections.items():
         if 'own words' in name.lower() or name.lower().startswith('no profile'):
             return body
     return ('No profile has been supplied. Do not infer goals, discipline or motivation '
-            'from the numbers — ask. A profile.md can be added next to the data '
-            '(see profile.example.md in the project).')
+            'from the numbers — ask. What they tell you can be kept with '
+            'health_profile_update.')
+
+
+PROFILE_MAX_CHARS = 20_000
+
+
+@tool(
+    'health_profile_update',
+    'Save what the person has told you about themselves that the data cannot show — '
+    'goals, injuries and surgeries with dates, conditions, medication, what they stopped '
+    'on purpose — so every later conversation starts from it. Only when they ask you to '
+    'remember something or agree to it being kept. Replaces the whole profile, so read '
+    'health_profile first and pass all of it back with the change: Markdown, with the '
+    'sections About me, What I am trying to do, Constraints, Context for the data. The '
+    'previous version is kept as profile.md.bak.',
+    obj({'content': {'type': 'string',
+                     'description': 'The complete profile in Markdown, old content included'}},
+        ['content']),
+)
+def _profile_update(data: HealthData, args: dict[str, Any]) -> str:
+    content = (args.get('content') or '').strip()
+    if not content:
+        raise ValueError('content is empty; pass the whole profile, old content included')
+    if len(content) > PROFILE_MAX_CHARS:
+        raise ValueError(f'content is {len(content):,} characters; keep it under '
+                         f'{PROFILE_MAX_CHARS:,}, a profile is a page, not a diary')
+    path = data.profile_path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as src, open(path + '.bak', 'w', encoding='utf-8') as dst:
+            dst.write(src.read())
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(content + '\n')
+    os.replace(tmp, path)
+    if data.watcher:
+        data.watcher.poll(force=True)
+        when = 'The briefing is being rebuilt with it now, in the background.'
+    else:
+        when = 'health_profile returns it from now on; the briefing includes it from the next rebuild.'
+    return f'Saved the profile ({len(content.splitlines())} lines) to {path}. {when}'
 
 
 @tool(
@@ -1592,6 +1646,8 @@ def handle(message: dict[str, Any], data: HealthData) -> dict[str, Any] | None:
         handler = HANDLERS.get(name)
         if handler is None:
             return make_error(request_id, -32602, f'Unknown tool: {name}')
+        if data.watcher:
+            data.watcher.poll()
         data.follow()
         if not data.ready():
             return make_result(request_id, {
@@ -1616,6 +1672,8 @@ def handle(message: dict[str, Any], data: HealthData) -> dict[str, Any] | None:
         # Every answer says how fresh the data is, so "missing" and "not synced
         # yet" are never confused.
         status = status_line(data)
+        if data.watcher and data.watcher.note():
+            status = f'{data.watcher.note()}\n\n{status}'.strip()
         if status:
             text = f'{status}\n\n{text}'
         # Capped here rather than in each tool: a new tool would otherwise be one
@@ -1642,7 +1700,12 @@ def serve(data: HealthData) -> None:
             continue
 
         try:
-            response = handle(message, data)
+            if data.watcher:
+                # A background rebuild swaps folders only while this is free.
+                with data.watcher.lock:
+                    response = handle(message, data)
+            else:
+                response = handle(message, data)
         except Exception as exc:  # noqa: BLE001 - keep the session alive
             log(f'handler error: {exc!r}')
             response = make_error(message.get('id'), -32603, str(exc))
@@ -1672,6 +1735,14 @@ def main() -> None:
     )
     parser.add_argument('--data-dir', default='output',
                         help='Directory holding the generated CSVs (default: output)')
+    parser.add_argument('--export', metavar='PATH',
+                        help='Build the data itself from the newest Apple Health export in this '
+                             'folder (or this .zip), in the background, and pick up newer ones '
+                             'as they arrive. Used by the Claude Desktop extension. Replaces '
+                             '--data-dir.')
+    parser.add_argument('--home', metavar='DIR',
+                        help='With --export: where the built data and the suggestions log are '
+                             'kept (default: the platform\'s app-data folder)')
     parser.add_argument('--state-dir',
                         help='Where the suggestions log is kept (default: beside the snapshots '
                              'for a health_sync.py folder, else the data dir)')
@@ -1688,7 +1759,16 @@ def main() -> None:
     global MAX_OUTPUT_CHARS
     MAX_OUTPUT_CHARS = max(1000, args.max_output_chars)
 
-    data = HealthData(args.data_dir, args.state_dir)
+    if args.export:
+        watcher = ExportWatcher(args.export, args.home)
+        data = HealthData(watcher.data_dir, args.state_dir or watcher.home)
+        data.watcher = watcher
+        watcher.poll(force=True)
+        if args.check and watcher._thread:
+            print(f'Reading {watcher.building} ...', flush=True)
+            watcher._thread.join()
+    else:
+        data = HealthData(args.data_dir, args.state_dir)
 
     if args.print_config:
         print(client_config(args.data_dir))

@@ -50,6 +50,23 @@ jobs:
           health-sync --help > /dev/null
           health-mcp --data-dir ci-run --check
 
+      - name: Claude Desktop extension builds and runs from its own files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python extension/build.py dist/health-context.mcpb
+          mkdir -p ext-run/bundle ext-run/Downloads
+          python -c "import zipfile; zipfile.ZipFile('dist/health-context.mcpb').extractall('ext-run/bundle')"
+          # Downloads with an export in it and a zip that is not one.
+          python -c "import zipfile; z = zipfile.ZipFile('ext-run/Downloads/export.zip', 'w'); z.write('fixtures/sample_export.xml', 'apple_health_export/export.xml'); z.close()"
+          python -c "import zipfile; z = zipfile.ZipFile('ext-run/Downloads/photos.zip', 'w'); z.writestr('a.jpg', 'x'); z.close()"
+          cd ext-run/bundle
+          python health_mcp.py --export ../Downloads --home ../home --check
+
+      - name: Extension manifest passes the official validator
+        if: runner.os == 'Linux' && matrix.python-version == '3.13'
+        run: npx -y @anthropic-ai/mcpb@2.1.2 validate ext-run/bundle/manifest.json
+
       - name: Every expected output exists and is non-empty
         shell: bash
         run: |

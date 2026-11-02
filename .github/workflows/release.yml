@@ -1,0 +1,43 @@
+name: Release
+
+# Publishing a release on GitHub attaches the Claude Desktop extension to it,
+# so the README's download link (releases/latest/download/health-context.mcpb)
+# always serves the newest one.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the extension to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build
+        run: python extension/build.py dist/health-context.mcpb
+
+      - name: Validate
+        run: |
+          mkdir -p bundle
+          python -c "import zipfile; zipfile.ZipFile('dist/health-context.mcpb').extractall('bundle')"
+          npx -y @anthropic-ai/mcpb@2.1.2 validate bundle/manifest.json
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name || inputs.tag }}" dist/health-context.mcpb --clobber

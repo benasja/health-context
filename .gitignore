@@ -52,3 +52,6 @@ output/
 
 # deploy/.env holds your paths and user id
 deploy/.env
+
+# Built by extension/build.py
+dist/

@@ -15,6 +15,7 @@ import pathlib
 import re
 import plistlib
 import tempfile
+import time
 import zipfile
 import unittest
 from collections import Counter
@@ -91,6 +92,7 @@ from health_insights import (
     rolling_mean,
 )
 import health_ingest
+import health_watch
 import health_mcp
 from health_mcp import (
     DEFAULT_PROTOCOL,
@@ -3413,6 +3415,143 @@ class TestRecommendations(unittest.TestCase):
         os.symlink(os.path.join(root, 'snapshots', 'a'), os.path.join(root, 'current'))
         self.assertEqual(health_recs.state_dir_for(os.path.join(root, 'current')), root)
         self.assertEqual(health_recs.state_dir_for(self.dir), os.path.abspath(self.dir))
+
+
+
+class TestExportWatcher(unittest.TestCase):
+    """The extension's server: builds its own data from whatever lands in Downloads."""
+
+    SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'sample_export.xml')
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.downloads = os.path.join(self.dir, 'Downloads')
+        os.makedirs(self.downloads)
+        self.home = os.path.join(self.dir, 'home')
+
+    def _zip(self, name, xml_path=None, mtime=None, member='apple_health_export/export.xml'):
+        path = os.path.join(self.downloads, name)
+        with zipfile.ZipFile(path, 'w') as z:
+            if xml_path:
+                z.write(xml_path, member)
+            else:
+                z.writestr('photo.jpg', b'not an export')
+        if mtime:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _built(self, watcher):
+        watcher.poll(force=True)
+        if watcher._thread:
+            watcher._thread.join()
+        return watcher
+
+    def test_the_newest_export_wins_and_other_zips_are_ignored(self):
+        older = self._zip('export.zip', self.SAMPLE, mtime=1_000_000)
+        self._zip('export 2.zip', self.SAMPLE, mtime=2_000_000)
+        self._zip('holiday photos.zip', mtime=3_000_000)
+        self.assertEqual(health_watch.find_export(self.downloads),
+                         os.path.join(self.downloads, 'export 2.zip'))
+        self.assertEqual(health_watch.find_export(older), older)
+        self.assertIsNone(health_watch.find_export(os.path.join(self.dir, 'missing')))
+
+    def test_before_any_export_it_says_how_to_make_one(self):
+        watcher = self._built(health_watch.ExportWatcher(self.downloads, self.home))
+        message = watcher.waiting_message()
+        self.assertIn('Export All Health Data', message)
+        self.assertIn(self.downloads, message)
+        self.assertFalse(os.path.exists(watcher.data_dir))
+
+    def test_an_export_is_built_once_and_a_newer_one_replaces_it(self):
+        self._zip('export.zip', self.SAMPLE, mtime=1_000_000)
+        watcher = self._built(health_watch.ExportWatcher(self.downloads, self.home))
+        data = HealthData(watcher.data_dir, watcher.home)
+        self.assertTrue(data.ready(), watcher.error)
+        # The unpacked gigabyte is not kept, only what the server reads.
+        self.assertFalse(os.path.exists(os.path.join(watcher.data_dir, '.extracted')))
+        first = watcher.built_from()
+
+        watcher._thread = None
+        self._built(watcher)
+        self.assertIsNone(watcher._thread, 'rebuilt an export it had already built')
+
+        self._zip('export 2.zip', self.SAMPLE, mtime=2_000_000)
+        self._built(watcher)
+        self.assertNotEqual(watcher.built_from(), first)
+        self.assertTrue(watcher.built_from()['path'].endswith('export 2.zip'))
+        self.assertEqual(sorted(os.listdir(self.home)), ['build.log', 'built_from.json', 'current'])
+
+    def test_a_broken_export_is_reported_and_not_retried(self):
+        broken = os.path.join(self.dir, 'export.xml')
+        with open(broken, 'w') as f:
+            f.write('<HealthData><Record type="')
+        self._zip('export.zip', broken)
+        watcher = self._built(health_watch.ExportWatcher(self.downloads, self.home))
+        self.assertTrue(watcher.error)
+        self.assertIn('could not be read', watcher.waiting_message())
+        watcher._thread = None
+        watcher.poll(force=True)
+        self.assertIsNone(watcher._thread)
+
+    def test_the_server_answers_while_building_and_keeps_suggestions_outside_the_build(self):
+        self._zip('export.zip', self.SAMPLE)
+        watcher = health_watch.ExportWatcher(self.downloads, self.home)
+        data = HealthData(watcher.data_dir, watcher.home)
+        data.watcher = watcher
+        watcher.building = 'export.zip'
+        watcher.started = time.time()
+        response = health_mcp.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                      'params': {'name': 'health_overview', 'arguments': {}}}, data)
+        self.assertIn('Reading the Apple Health export', response['result']['content'][0]['text'])
+        watcher.building = None
+        self._built(watcher)
+        self.assertEqual(data.recs.path, os.path.join(self.home, 'recommendations.jsonl'))
+
+
+
+class TestProfileUpdate(unittest.TestCase):
+    """What someone tells the assistant about themselves, kept for the next conversation."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.data = HealthData(self.dir)
+
+    def _call(self, name, args, data=None):
+        return health_mcp.HANDLERS[name](data or self.data, args)
+
+    def test_a_saved_profile_is_read_back_and_the_old_one_kept(self):
+        self.assertIn('No profile has been supplied', self._call('health_profile', {}))
+        self._call('health_profile_update', {'content': '## Constraints\n- Wrist surgery Nov 2025'})
+        self._call('health_profile_update', {'content': '## Constraints\n- Wrist surgery Nov 2025\n'
+                                                        '- Knee fine again'})
+        self.assertIn('Knee fine again', self._call('health_profile', {}))
+        with open(os.path.join(self.dir, 'profile.md.bak'), encoding='utf-8') as f:
+            self.assertNotIn('Knee', f.read())
+        # Where the converter looks, so the next rebuild puts it in the briefing.
+        self.assertEqual(health_ingest.find_profile(self.dir), os.path.join(self.dir, 'profile.md'))
+
+    def test_an_empty_or_huge_profile_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._call('health_profile_update', {'content': '  '})
+        with self.assertRaises(ValueError):
+            self._call('health_profile_update', {'content': 'x' * 30_000})
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'profile.md')))
+
+    def test_with_an_export_folder_a_new_profile_rebuilds_the_briefing(self):
+        downloads = os.path.join(self.dir, 'Downloads')
+        os.makedirs(downloads)
+        with zipfile.ZipFile(os.path.join(downloads, 'export.zip'), 'w') as z:
+            z.write(TestExportWatcher.SAMPLE, 'apple_health_export/export.xml')
+        watcher = health_watch.ExportWatcher(downloads, os.path.join(self.dir, 'home'))
+        watcher.poll(force=True)
+        watcher._thread.join()
+        data = HealthData(watcher.data_dir, watcher.home)
+        data.watcher = watcher
+        self.assertNotIn('Wrist surgery', data.doc('context'))
+        self._call('health_profile_update', {'content': '## Constraints\n- Wrist surgery Nov 2025'}, data)
+        watcher._thread.join()
+        data.follow()
+        self.assertIn('Wrist surgery', data.doc('context'))
 
 
 if __name__ == '__main__':

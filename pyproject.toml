@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "health-context"
-version = "2.5.0"
+version = "2.6.0"
 description = "Turn an Apple Health export into a context pack an LLM can reason about"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,4 +52,5 @@ py-modules = [
     "health_recs",
     "health_strength",
     "health_sync",
+    "health_watch",
 ]
